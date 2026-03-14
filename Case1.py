@@ -1,19 +1,22 @@
 """
 Van Territory Planner — 4-Pipeline Benchmark
-  A) MCF + OSRM Trip          — cost-first two-stage baseline
-  B) P-Median + OSRM Trip     — territory-first two-stage baseline
-  C) MCF + OR-Tools TSP       — same zones as A, better local ordering
+  A) MCF + OSRM Path          — cost-first two-stage baseline
+  B) P-Median + OSRM Path     — territory-first two-stage baseline
+  C) MCF + OR-Tools Path      — same zones as A, better local ordering
   D) Full OR-Tools CVRP       — integrated single-stage benchmark
-All pipelines use the OSRM road-network matrix. Routes follow real streets.
+All pipelines share one explicit route model. Routes follow real streets.
 """
 import streamlit as st
 import numpy as np
+import pandas as pd
+import json
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.animation import FuncAnimation, PillowWriter
 from scipy.spatial import distance_matrix as scipy_dm
+from scipy.optimize import linear_sum_assignment
 from sklearn.cluster import KMeans
 import networkx as nx
 import contextily as ctx
@@ -35,7 +38,7 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
 html,body,[class*="css"]{font-family:'IBM Plex Sans',sans-serif}
-.block-container{padding-top:1rem}
+.block-container{padding-top:1.15rem}
 .stNumberInput input{font-size:1.6rem!important;font-weight:600!important;
   text-align:center;font-family:'IBM Plex Mono',monospace!important}
 .stButton>button{background:#0f172a;color:#e2e8f0;border:1px solid #334155;
@@ -64,7 +67,10 @@ html,body,[class*="css"]{font-family:'IBM Plex Sans',sans-serif}
 [data-testid="stSidebar"]{background:#0a0f1e;border-right:1px solid #1e293b}
 [data-testid="stSidebar"] label{font-family:'IBM Plex Mono',monospace;
   font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em}
-h1{font-family:'IBM Plex Mono',monospace;font-size:1.25rem!important;color:#e2e8f0}
+h1{font-family:'IBM Plex Mono',monospace;font-size:1.25rem!important;color:#e2e8f0;line-height:1.25!important}
+.page-title{display:flex;align-items:center;gap:.5rem;margin:0 0 .15rem 0;padding-top:.1rem;
+  font-family:'IBM Plex Mono',monospace;font-size:1.9rem;font-weight:600;line-height:1.2;color:#e2e8f0}
+.page-title-icon{display:inline-flex;align-items:center;line-height:1;transform:translateY(1px)}
 .stTabs [data-baseweb="tab"]{font-family:'IBM Plex Mono',monospace;font-size:.72rem}
 footer{visibility:hidden}
 </style>
@@ -177,6 +183,109 @@ def osrm_distance_matrix(lonlat: np.ndarray, status_cb=None):
     return euc, None, False
 
 
+def _clean_osrm_values(mat: np.ndarray) -> np.ndarray:
+    finite = mat[np.isfinite(mat)]
+    fill = finite.max() * 2 if len(finite) > 0 else 1e6
+    return np.where(np.isfinite(mat), mat, fill)
+
+
+def _approx_block_matrices(src_lonlat: np.ndarray, dst_lonlat: np.ndarray,
+                           speed_kmh: float = 32.0):
+    """
+    Fallback rectangular travel matrices from straight-line geography.
+    Distance is meters; duration assumes a fixed average road speed.
+    """
+    shape = (len(src_lonlat), len(dst_lonlat))
+    if shape[0] == 0 or shape[1] == 0:
+        return np.zeros(shape), np.zeros(shape)
+
+    lon1 = np.radians(src_lonlat[:, 0])[:, None]
+    lat1 = np.radians(src_lonlat[:, 1])[:, None]
+    lon2 = np.radians(dst_lonlat[:, 0])[None, :]
+    lat2 = np.radians(dst_lonlat[:, 1])[None, :]
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+
+    a = (np.sin(dlat / 2.0) ** 2 +
+         np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2)
+    c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(np.maximum(1.0 - a, 0.0)))
+    dist_m = 6_371_000.0 * c
+    dur_s = dist_m / max(speed_kmh * 1000.0 / 3600.0, 1e-9)
+    return dur_s, dist_m
+
+
+def osrm_rectangular_matrix(src_lonlat: np.ndarray, dst_lonlat: np.ndarray):
+    """
+    Fetch a rectangular OSRM table block for source -> destination travel.
+    Returns (dur_s, dist_m, osrm_used_for_block).
+    Falls back to straight-line meters + fixed-speed seconds when OSRM fails.
+    """
+    shape = (len(src_lonlat), len(dst_lonlat))
+    if shape[0] == 0 or shape[1] == 0:
+        zeros = np.zeros(shape)
+        return zeros, zeros, True
+
+    block_step = max(1, OSRM_CHUNK // 2)
+
+    for base in OSRM_BASES:
+        dur_out = np.full(shape, np.nan, dtype=float)
+        dist_out = np.full(shape, np.nan, dtype=float)
+        dist_ok = True
+        failed = False
+
+        for i0 in range(0, len(src_lonlat), block_step):
+            src_block = src_lonlat[i0:i0 + block_step]
+            for j0 in range(0, len(dst_lonlat), block_step):
+                dst_block = dst_lonlat[j0:j0 + block_step]
+                coords = np.vstack([src_block, dst_block])
+                coord_str = ";".join(f"{lon},{lat}" for lon, lat in coords)
+                src_idx = ";".join(str(i) for i in range(len(src_block)))
+                dst_idx = ";".join(str(len(src_block) + j) for j in range(len(dst_block)))
+                url = (
+                    f"{base}/table/v1/driving/{coord_str}"
+                    f"?annotations=duration,distance&sources={src_idx}&destinations={dst_idx}"
+                )
+                try:
+                    r = requests.get(url, timeout=20)
+                    if r.status_code != 200:
+                        failed = True
+                        break
+                    data = r.json()
+                    if data.get("code") != "Ok":
+                        failed = True
+                        break
+                    dur_chunk = np.array(data["durations"], dtype=float)
+                    if dur_chunk.shape != (len(src_block), len(dst_block)):
+                        failed = True
+                        break
+                    dur_out[i0:i0 + len(src_block), j0:j0 + len(dst_block)] = dur_chunk
+
+                    if "distances" in data:
+                        dist_chunk = np.array(data["distances"], dtype=float)
+                        if dist_chunk.shape == (len(src_block), len(dst_block)):
+                            dist_out[i0:i0 + len(src_block), j0:j0 + len(dst_block)] = dist_chunk
+                        else:
+                            dist_ok = False
+                    else:
+                        dist_ok = False
+                except Exception:
+                    failed = True
+                    break
+            if failed:
+                break
+
+        if not failed and np.isfinite(dur_out).all():
+            dur_out = _clean_osrm_values(dur_out)
+            if dist_ok and np.isfinite(dist_out).all():
+                dist_out = _clean_osrm_values(dist_out)
+            else:
+                dist_out = None
+            return dur_out, dist_out, True
+
+    dur_fb, dist_fb = _approx_block_matrices(src_lonlat, dst_lonlat)
+    return dur_fb, dist_fb, False
+
+
 def osrm_route_geometry(ordered_lonlat: np.ndarray) -> list[tuple] | None:
     """
     Get road-following polyline for an ordered stop sequence.
@@ -219,84 +328,48 @@ def ordered_route_geometry(ordered_lonlat: np.ndarray):
     return None
 
 
-def osrm_trip(cluster_lonlat: np.ndarray):
-    """
-    OSRM /trip/v1/ — farthest-insertion TSP on the road network.
-    Returns (orig_order, geom_wm, dist_m, dur_s) or (None, None, 0, 0) on failure.
-      orig_order : list of original input indices in OSRM visit order
-      geom_wm    : list of (x_wm, y_wm) — full road polyline
-      dist_m     : total route distance in meters
-      dur_s      : total route duration in seconds
-    """
-    if len(cluster_lonlat) < 2:
-        return None, None, 0.0, 0.0
-    coord_str = ";".join(f"{lon},{lat}" for lon, lat in cluster_lonlat)
-    for base in OSRM_BASES:
-        try:
-            url = (f"{base}/trip/v1/driving/{coord_str}"
-                   f"?roundtrip=true&overview=full&geometries=geojson")
-            r = requests.get(url, timeout=20)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("code") == "Ok" and data.get("trips"):
-                    trip      = data["trips"][0]
-                    dist_m    = float(trip.get("distance", 0.0))
-                    dur_s     = float(trip.get("duration", 0.0))
-                    waypoints = data["waypoints"]
-                    # orig_order[i] = original input index of the i-th stop visited
-                    orig_order = sorted(range(len(waypoints)),
-                                        key=lambda i: waypoints[i]["waypoint_index"])
-                    coords = trip["geometry"]["coordinates"]
-                    wm     = to_wm(np.array(coords))
-                    return orig_order, list(map(tuple, wm)), dist_m, dur_s
-        except Exception:
-            continue
-    return None, None, 0.0, 0.0
+def _approx_path_metrics(ordered_lonlat: np.ndarray):
+    if len(ordered_lonlat) < 2:
+        return 0.0, 0.0
+    dur_seg, dist_seg = _approx_block_matrices(ordered_lonlat[:-1], ordered_lonlat[1:])
+    return float(np.trace(dist_seg)), float(np.trace(dur_seg))
 
 
-def _fetch_route_for_van(args):
+def build_route_geometries(route_sequences: dict, close_loop: bool = False):
     """
-    Worker: fetch OSRM trip geometry + metrics for a single van.
-    Returns (k, order, geom_wm, dist_m, dur_s).
-    Runs in thread pool for parallel fetching.
-    """
-    k, cluster_ll = args
-    if len(cluster_ll) < 2:
-        return k, list(range(len(cluster_ll))), None, 0.0, 0.0
-    order, geom_wm, dist_m, dur_s = osrm_trip(cluster_ll)
-    if order is not None and geom_wm is not None:
-        return k, order, geom_wm, dist_m, dur_s
-    # fallback: sequential geometry via /route/
-    loop_pts = np.vstack([cluster_ll, cluster_ll[:1]])
-    result = ordered_route_geometry(loop_pts)
-    if result:
-        geom, dist_m, dur_s = result
-        return k, list(range(len(cluster_ll))), geom, dist_m, dur_s
-    return k, list(range(len(cluster_ll))), None, 0.0, 0.0
-
-
-def fetch_all_routes(lonlat_pts, labels, K):
-    """
-    Fetch OSRM trip routes for all K vans in PARALLEL.
-    Returns:
-      routes     — dict {k: [local_indices in OSRM visit order]}
-      geoms      — dict {k: [(x_wm, y_wm)] street polylines}
-      route_dist — dict {k: dist_m}   road distance per van in meters
-      route_dur  — dict {k: dur_s}    road duration per van in seconds
+    Route OSRM geometry/metrics for already-ordered stop sequences.
+    route_sequences : {vehicle: lonlat_array_in_exact_visit_order}
+    Returns (geoms, route_dist, route_dur, all_osrm_exact).
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    tasks = [(k, lonlat_pts[labels == k]) for k in range(K) if (labels == k).any()]
-    routes, geoms, route_dist, route_dur = {}, {}, {}, {}
-    with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
-        futures = {pool.submit(_fetch_route_for_van, t): t[0] for t in tasks}
+
+    def _fetch_one(args):
+        v, ordered_ll = args
+        ordered_ll = np.asarray(ordered_ll, dtype=float)
+        if len(ordered_ll) < 2:
+            return v, None, 0.0, 0.0, True
+        if close_loop and not np.allclose(ordered_ll[0], ordered_ll[-1]):
+            ordered_ll = np.vstack([ordered_ll, ordered_ll[:1]])
+        result = ordered_route_geometry(ordered_ll)
+        if result:
+            geom, dist_m, dur_s = result
+            return v, geom, dist_m, dur_s, True
+        dist_m, dur_s = _approx_path_metrics(ordered_ll)
+        return v, None, dist_m, dur_s, False
+
+    tasks = [(v, seq) for v, seq in route_sequences.items() if len(seq) >= 1]
+    geoms, route_dist, route_dur = {}, {}, {}
+    all_osrm_exact = True
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(tasks)))) as pool:
+        futures = {pool.submit(_fetch_one, t): t[0] for t in tasks}
         for fut in as_completed(futures):
-            k, order, geom, dist_m, dur_s = fut.result()
-            routes[k]     = order
-            route_dist[k] = dist_m
-            route_dur[k]  = dur_s
+            v, geom, dist_m, dur_s, exact = fut.result()
+            route_dist[v] = dist_m
+            route_dur[v] = dur_s
+            all_osrm_exact &= exact
             if geom:
-                geoms[k] = geom
-    return routes, geoms, route_dist, route_dur
+                geoms[v] = geom
+    return geoms, route_dist, route_dur, all_osrm_exact
 
 
 # ──────────────────────────────────────────────────────
@@ -341,10 +414,230 @@ def fix_empty(pts, L, C, K):
     return L, C
 
 
+def greedy_capacitated_assignment(cost_to_anchor: np.ndarray, cap: int) -> np.ndarray:
+    """
+    Greedy capacity-respecting fallback assignment.
+    Every stop is assigned exactly once unless the instance is infeasible.
+    """
+    n, K = cost_to_anchor.shape
+    loads = np.zeros(K, dtype=int)
+    labels = -np.ones(n, dtype=int)
+    order = np.argsort(cost_to_anchor.min(axis=1))
+    for i in order:
+        for k in np.argsort(cost_to_anchor[i]):
+            if loads[k] < cap:
+                labels[i] = int(k)
+                loads[k] += 1
+                break
+    if (labels < 0).any():
+        raise ValueError("Capacitated assignment failed: not enough vehicle capacity.")
+    return labels
+
+
+def _shared_seeded_starts(pts_ll: np.ndarray, K: int) -> np.ndarray:
+    """
+    Shared vehicle start seeds used by all pipelines when seeded starts are selected.
+    These are independent of any pipeline-specific assignment to keep the benchmark fair.
+    """
+    bbox = (pts_ll[:, 0].min(), pts_ll[:, 1].min(),
+            pts_ll[:, 0].max(), pts_ll[:, 1].max())
+    pts_n = norm(pts_ll, bbox)
+    centers_n = KMeans(K, init="k-means++", n_init=8, max_iter=100,
+                       random_state=0).fit(pts_n).cluster_centers_
+    order = np.lexsort((centers_n[:, 1], centers_n[:, 0]))
+    return denorm(centers_n[order], bbox)
+
+
+def build_shared_route_model(pts_ll: np.ndarray, K: int, cap_pct: int,
+                             cost_matrix: np.ndarray, start_policy: str,
+                             end_policy: str, demand_per_stop: float = 1.0):
+    """
+    Shared operational route model used by every pipeline.
+    Starts/ends live here so A/B/C/D are evaluated under identical assumptions.
+    """
+    n = len(pts_ll)
+    cap_stops = int(np.ceil(n / K * cap_pct / 100))
+    shared_depot_ll = pts_ll.mean(axis=0)
+
+    if start_policy == "centroid":
+        starts_ll = np.repeat(shared_depot_ll[np.newaxis, :], K, axis=0)
+    elif start_policy == "seeded":
+        starts_ll = _shared_seeded_starts(pts_ll, K)
+    elif start_policy == "random":
+        bbox = (pts_ll[:, 0].min(), pts_ll[:, 1].min(),
+                pts_ll[:, 0].max(), pts_ll[:, 1].max())
+        rng = np.random.default_rng(42)
+        starts_ll = np.column_stack([
+            rng.uniform(bbox[0], bbox[2], K),
+            rng.uniform(bbox[1], bbox[3], K),
+        ])
+    else:
+        raise ValueError(f"Unknown start_policy: {start_policy}")
+
+    if end_policy == "return_to_start":
+        ends_ll = starts_ll.copy()
+    elif end_policy == "return_to_depot":
+        ends_ll = np.repeat(shared_depot_ll[np.newaxis, :], K, axis=0)
+    elif end_policy == "open":
+        ends_ll = None
+    else:
+        raise ValueError(f"Unknown end_policy: {end_policy}")
+
+    start_to_stop_dur, _, start_exact = osrm_rectangular_matrix(starts_ll, pts_ll)
+    if ends_ll is not None:
+        stop_to_end_dur, _, end_exact = osrm_rectangular_matrix(pts_ll, ends_ll)
+    else:
+        stop_to_end_dur = np.zeros((n, K), dtype=float)
+        end_exact = True
+
+    median_stop = float(np.nanmedian(cost_matrix[np.isfinite(cost_matrix)])) if np.isfinite(cost_matrix).any() else 0.0
+    median_start = float(np.nanmedian(start_to_stop_dur[np.isfinite(start_to_stop_dur)])) if np.isfinite(start_to_stop_dur).any() else 0.0
+    scale_ratio = (max(median_stop, median_start) / max(min(median_stop, median_start), 1e-9)
+                   if median_stop > 0 and median_start > 0 else 1.0)
+
+    return {
+        "n": n,
+        "K": K,
+        "points_ll": pts_ll,
+        "cost_matrix": cost_matrix,
+        "cap_pct": int(cap_pct),
+        "start_policy": start_policy,
+        "end_policy": end_policy,
+        "roundtrip": bool(ends_ll is not None and np.allclose(starts_ll, ends_ll)),
+        "starts_ll": starts_ll,
+        "ends_ll": ends_ll,
+        "shared_depot_ll": shared_depot_ll,
+        "start_to_stop_dur": start_to_stop_dur,
+        "stop_to_end_dur": stop_to_end_dur,
+        "cap_stops": cap_stops,
+        "demand_per_stop": float(demand_per_stop),
+        "capacity_units": float(cap_stops * demand_per_stop),
+        "demands": np.full(n, float(demand_per_stop)),
+        "routing_cost_basis": "OSRM duration with explicit start/end legs",
+        "terminal_costs_exact": bool(start_exact and end_exact),
+        "scale_ratio": float(scale_ratio),
+    }
+
+
+def realign_labels_to_shared_starts(labels: np.ndarray, centers: np.ndarray,
+                                    route_model: dict, meta: dict | None = None):
+    """
+    Relabel staged-pipeline territories so van k always refers to shared start k.
+    Without this, A/B/C can sequence the right territory with the wrong van origin.
+    """
+    K = route_model["K"]
+    relabel_cost = np.zeros((K, K), dtype=float)
+
+    for old_k in range(K):
+        idx = np.where(labels == old_k)[0]
+        if len(idx) == 0:
+            relabel_cost[old_k] = 0.0
+            continue
+        access = route_model["start_to_stop_dur"][:, idx].mean(axis=1)
+        if route_model["end_policy"] != "open":
+            egress = route_model["stop_to_end_dur"][idx, :].mean(axis=0)
+        else:
+            egress = np.zeros(K, dtype=float)
+        relabel_cost[old_k] = access + egress
+
+    old_ids, new_ids = linear_sum_assignment(relabel_cost)
+    mapping = {int(old): int(new) for old, new in zip(old_ids, new_ids)}
+
+    new_labels = np.array([mapping[int(k)] for k in labels], dtype=int)
+    new_centers = np.zeros_like(centers)
+    for old_k, new_k in mapping.items():
+        if old_k < len(centers):
+            new_centers[new_k] = centers[old_k]
+
+    new_meta = None
+    if meta is not None:
+        new_meta = dict(meta)
+        if "assignment_cost_per_vehicle" in meta:
+            new_meta["assignment_cost_per_vehicle"] = {
+                mapping.get(int(k), int(k)): float(v)
+                for k, v in meta["assignment_cost_per_vehicle"].items()
+            }
+        for key in ("seed_indices", "median_indices"):
+            if key in meta and len(meta[key]) == K:
+                remapped = [None] * K
+                for old_k, value in enumerate(meta[key]):
+                    remapped[mapping.get(old_k, old_k)] = value
+                new_meta[key] = remapped
+        new_meta["cluster_start_mapping"] = mapping
+
+    return new_labels, new_centers, new_meta, mapping
+
+
+def compute_vehicle_path_cost(order: list[int], vehicle: int, route_model: dict) -> float:
+    if len(order) == 0:
+        return 0.0
+    cost = float(route_model["start_to_stop_dur"][vehicle, order[0]])
+    for i in range(len(order) - 1):
+        cost += float(route_model["cost_matrix"][order[i], order[i + 1]])
+    if route_model["end_policy"] != "open":
+        cost += float(route_model["stop_to_end_dur"][order[-1], vehicle])
+    return cost
+
+
+def _two_opt_path(order: list[int], vehicle: int, route_model: dict) -> list[int]:
+    if len(order) < 4:
+        return order
+    best = order[:]
+    best_cost = compute_vehicle_path_cost(best, vehicle, route_model)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(len(best) - 1):
+            for j in range(i + 2, len(best) + 1):
+                cand = best[:i] + best[i:j][::-1] + best[j:]
+                cand_cost = compute_vehicle_path_cost(cand, vehicle, route_model)
+                if cand_cost + 1e-9 < best_cost:
+                    best = cand
+                    best_cost = cand_cost
+                    improved = True
+                    break
+            if improved:
+                break
+    return best
+
+
+def heuristic_sequence_route(stop_indices: list[int], vehicle: int, route_model: dict):
+    """
+    A/B sequencing: deterministic path heuristic on the OSRM duration matrix.
+    This uses the same starts/ends as the rest of the benchmark without relying on OSRM /trip.
+    """
+    remaining = list(map(int, stop_indices))
+    if not remaining:
+        return [], 0.0
+
+    first = min(
+        remaining,
+        key=lambda s: route_model["start_to_stop_dur"][vehicle, s] +
+        (0.0 if route_model["end_policy"] == "open"
+         else route_model["stop_to_end_dur"][s, vehicle])
+    )
+    route = [int(first)]
+    remaining.remove(first)
+
+    while remaining:
+        best_stop, best_pos, best_cost = None, None, float("inf")
+        for stop in remaining:
+            for pos in range(len(route) + 1):
+                cand = route[:pos] + [int(stop)] + route[pos:]
+                cand_cost = compute_vehicle_path_cost(cand, vehicle, route_model)
+                if cand_cost < best_cost:
+                    best_stop, best_pos, best_cost = int(stop), pos, cand_cost
+        route.insert(best_pos, best_stop)
+        remaining.remove(best_stop)
+
+    route = _two_opt_path(route, vehicle, route_model)
+    return route, compute_vehicle_path_cost(route, vehicle, route_model)
+
+
 # ──────────────────────────────────────────────────────
 #  PIPELINE A — Min-Cost Flow
 # ──────────────────────────────────────────────────────
-def run_mcf(pts_ll, K, cap_pct, cost_matrix):
+def run_mcf(pts_ll, K, cap_pct, cost_matrix, return_meta=False):
     """pts_ll = lon/lat array, cost_matrix = NxN (OSRM seconds or Euclidean)"""
     n = len(pts_ll)
     cap = int(np.ceil(n / K * cap_pct / 100))
@@ -387,19 +680,30 @@ def run_mcf(pts_ll, K, cap_pct, cost_matrix):
                 if flow.get(f"p{i}",{}).get(f"v{v}",0) > 0:
                     L[i] = v; break
     except Exception:
-        L = C.argmin(1)
+        L = greedy_capacitated_assignment(C, cap)
 
     # Compute centers as centroids of assigned points (in normalized space)
     Cn = np.array([pts_n[L==k].mean(0) if (L==k).any() else pts_n.mean(0)
                    for k in range(K)])
     L, Cn = fix_empty(pts_n, L, Cn, K)
-    return L, Cn
+    if not return_meta:
+        return L, Cn
+
+    per_vehicle = {k: float(C[L == k, k].sum()) for k in range(K)}
+    meta = {
+        "assignment_cost_total": float(sum(per_vehicle.values())),
+        "assignment_cost_per_vehicle": per_vehicle,
+        "assignment_cost_basis": "OSRM stop-to-seed duration",
+        "capacity_enforced": True,
+        "seed_indices": seed_idx,
+    }
+    return L, Cn, meta
 
 
 # ──────────────────────────────────────────────────────
 #  PIPELINE B — Capacitated P-Median
 # ──────────────────────────────────────────────────────
-def run_pmedian(pts_ll, K, cap_pct, max_iter, cost_matrix):
+def run_pmedian(pts_ll, K, cap_pct, max_iter, cost_matrix, return_meta=False):
     n = len(pts_ll)
     cap = int(np.ceil(n / K * cap_pct / 100))
     pts_n = norm(pts_ll, (pts_ll[:,0].min(), pts_ll[:,1].min(),
@@ -409,6 +713,7 @@ def run_pmedian(pts_ll, K, cap_pct, max_iter, cost_matrix):
                        random_state=0).fit(pts_n).labels_
     L = km_labels.copy()
 
+    median_idx = [0] * K
     for _ in range(max_iter):
         # Use OSRM cost matrix for assignment distances
         nL = -np.ones(n, dtype=int); ld = np.zeros(K, dtype=int)
@@ -428,7 +733,8 @@ def run_pmedian(pts_ll, K, cap_pct, max_iter, cost_matrix):
         for i in np.argsort(D_to_medians.min(1)):
             for k in np.argsort(D_to_medians[i]):
                 if ld[k] < cap: nL[i]=k; ld[k]+=1; break
-            if nL[i] < 0: nL[i] = D_to_medians[i].argmin()
+            if nL[i] < 0:
+                raise ValueError("P-Median assignment exceeded vehicle capacity.")
 
         if np.all(nL == L): break
         L = nL
@@ -437,7 +743,29 @@ def run_pmedian(pts_ll, K, cap_pct, max_iter, cost_matrix):
     Cn = np.array([pts_n[L==k].mean(0) if (L==k).any() else pts_n.mean(0)
                    for k in range(K)])
     L, Cn = fix_empty(pts_n, L, Cn, K)
-    return L, Cn
+    if not return_meta:
+        return L, Cn
+
+    final_median_idx = []
+    per_vehicle = {}
+    for k in range(K):
+        idx_k = np.where(L == k)[0]
+        if len(idx_k):
+            sub = cost_matrix[np.ix_(idx_k, idx_k)]
+            med = int(idx_k[int(sub.sum(axis=1).argmin())])
+            final_median_idx.append(med)
+            per_vehicle[k] = float(cost_matrix[np.ix_(idx_k, [med])].sum())
+        else:
+            final_median_idx.append(0)
+            per_vehicle[k] = 0.0
+    meta = {
+        "assignment_cost_total": float(sum(per_vehicle.values())),
+        "assignment_cost_per_vehicle": per_vehicle,
+        "assignment_cost_basis": "OSRM stop-to-median duration",
+        "capacity_enforced": True,
+        "median_indices": final_median_idx,
+    }
+    return L, Cn, meta
 
 
 
@@ -449,7 +777,8 @@ def run_pmedian(pts_ll, K, cap_pct, max_iter, cost_matrix):
 # ──────────────────────────────────────────────────────
 #  STATIC MAP — draws OSRM geometries OR straight lines
 # ──────────────────────────────────────────────────────
-def make_map(ll_pts, L, ll_ctr_n, bbox, title, road_geoms=None, tile_src=None):
+def make_map(ll_pts, L, ll_ctr_n, bbox, title, road_geoms=None, tile_src=None,
+             route_model=None):
     """
     road_geoms: dict {k: [(x_wm, y_wm), ...]} — actual street polylines.
     If None or missing for a cluster, falls back to straight lines.
@@ -505,6 +834,20 @@ def make_map(ll_pts, L, ll_ctr_n, bbox, title, road_geoms=None, tile_src=None):
                     bbox=dict(boxstyle="round,pad=0.2", fc=colors[k], alpha=0.75, ec="none"),
                     zorder=8)
 
+    # configured starts / ends so the map matches the actual route model
+    if route_model is not None:
+        start_wm = to_wm(route_model["starts_ll"])
+        for k, s in enumerate(start_wm):
+            ax.scatter(s[0], s[1], s=85, color=colors[k], edgecolors="white",
+                       linewidths=1.4, zorder=9, marker="D", alpha=0.95)
+        if route_model["end_policy"] != "open":
+            end_wm = to_wm(route_model["ends_ll"])
+            for k, e in enumerate(end_wm):
+                if np.allclose(route_model["starts_ll"][k], route_model["ends_ll"][k]):
+                    continue
+                ax.scatter(e[0], e[1], s=65, color=colors[k], edgecolors="white",
+                           linewidths=1.1, zorder=9, marker="s", alpha=0.9)
+
     # OSRM badge
     has_roads = road_geoms and any(road_geoms.values())
     badge = "🛣 Real road routes (OSRM)" if has_roads else "📐 Euclidean lines (OSRM unavailable)"
@@ -513,6 +856,10 @@ def make_map(ll_pts, L, ll_ctr_n, bbox, title, road_geoms=None, tile_src=None):
             fontfamily="monospace", va="bottom", zorder=12,
             bbox=dict(boxstyle="round,pad=0.3",
                       fc="#064e3b" if has_roads else "#7f1d1d", alpha=0.8, ec="none"))
+    ax.text(0.01, 0.06, "halos = assignment overlays, not exact optimized boundaries",
+            transform=ax.transAxes, fontsize=6.2, color="#94a3b8",
+            fontfamily="monospace", va="bottom", zorder=12,
+            bbox=dict(boxstyle="round,pad=0.25", fc="#0f172a", alpha=0.75, ec="none"))
 
     ax.set_axis_off()
     ax.set_title(title, fontsize=10, color="#94a3b8",
@@ -531,12 +878,16 @@ def _param(path):
 
 
 def make_gif(ll_pts, L, ll_ctr_n, bbox, road_geoms,
-             tile_src, n_frames=140, fps=20, trail=18):
+             tile_src, route_model=None, n_frames=140, fps=20, trail=18):
     ll_ctr = denorm(ll_ctr_n, bbox)
     K = max(int(L.max())+1, len(ll_ctr))
     colors = [PALETTE[k%len(PALETTE)] for k in range(K)]
     wm = to_wm(ll_pts); cw = to_wm(ll_ctr)
     dep = cw.mean(0)
+    start_wm = to_wm(route_model["starts_ll"]) if route_model is not None else None
+    end_wm = (to_wm(route_model["ends_ll"])
+              if route_model is not None and route_model["end_policy"] != "open"
+              else None)
 
     paths = []
     for k in range(K):
@@ -544,10 +895,17 @@ def make_gif(ll_pts, L, ll_ctr_n, bbox, road_geoms,
             # use the actual OSRM street geometry as the vehicle path
             path = np.array(road_geoms[k])
         else:
-            # fallback: straight lines depot→stops→depot
-            m = L==k
-            if not m.any(): paths.append(_param(np.vstack([dep,dep]))); continue
-            paths.append(_param(np.vstack([dep[np.newaxis], wm[m], dep[np.newaxis]])))
+            # fallback: straight lines under the same configured route model
+            m = L == k
+            start_pt = dep if start_wm is None else start_wm[k]
+            if not m.any():
+                end_pt = start_pt if end_wm is None else end_wm[k]
+                paths.append(_param(np.vstack([start_pt, end_pt])))
+                continue
+            seq = [start_pt[np.newaxis], wm[m]]
+            if end_wm is not None:
+                seq.append(end_wm[k][np.newaxis])
+            paths.append(_param(np.vstack(seq)))
             continue
         paths.append(_param(path))
 
@@ -570,8 +928,19 @@ def make_gif(ll_pts, L, ll_ctr_n, bbox, road_geoms,
             r = np.linalg.norm(wm[m]-cw[k],axis=1).max()*0.55
             ax.add_patch(plt.Circle(cw[k], r, color=colors[k], alpha=0.06, zorder=2))
 
-    ax.scatter(dep[0],dep[1], s=220, color="#ef4444", marker="D",
-               edgecolors="white", linewidths=2, zorder=5)
+    if route_model is None:
+        ax.scatter(dep[0],dep[1], s=220, color="#ef4444", marker="D",
+                   edgecolors="white", linewidths=2, zorder=5)
+    else:
+        for k, s in enumerate(start_wm):
+            ax.scatter(s[0], s[1], s=110, color=colors[k], marker="D",
+                       edgecolors="white", linewidths=1.5, zorder=5)
+        if end_wm is not None:
+            for k, e in enumerate(end_wm):
+                if np.allclose(route_model["starts_ll"][k], route_model["ends_ll"][k]):
+                    continue
+                ax.scatter(e[0], e[1], s=90, color=colors[k], marker="s",
+                           edgecolors="white", linewidths=1.2, zorder=5)
 
     dots   = [ax.plot([],[], "o", ms=13, color=c, markeredgecolor="white",
                        markeredgewidth=1.4, zorder=10)[0] for c in colors]
@@ -629,24 +998,32 @@ def size_chart(sizes):
 
 
 # ──────────────────────────────────────────────────────
-#  PIPELINE C — MCF + OR-Tools per-cluster TSP
-#  "Same zones as A, better local sequencing"
+#  PIPELINE C — MCF + OR-Tools per-cluster path sequencing
+#  Same assignment as A, but with a stronger local route solver.
 # ──────────────────────────────────────────────────────
-def _ortools_tsp_cluster(indices, cost_matrix, time_limit_s=4):
-    """OR-Tools TSP for a single cluster — better ordering than 2-opt."""
-    n = len(indices)
-    if n <= 2:
-        length = cost_matrix[indices[0], indices[1]] if n == 2 else 0.0
-        return list(range(n)), float(length)
+def solve_single_vehicle_path(stop_indices: list[int], vehicle: int,
+                              route_model: dict, time_limit_s: int = 4):
+    """
+    OR-Tools single-vehicle path under the shared route model.
+    Used by Pipeline C so its route model exactly matches A/B/D.
+    """
+    stop_indices = list(map(int, stop_indices))
+    if len(stop_indices) <= 1:
+        return stop_indices, compute_vehicle_path_cost(stop_indices, vehicle, route_model)
 
-    SCALE = 100_000
-    sub = (cost_matrix[np.ix_(indices, indices)] * SCALE).astype(int)
-    full = np.zeros((n+1, n+1), dtype=int)
-    full[1:, 1:] = sub   # depot row/col = 0 (open TSP)
+    sub_cost = route_model["cost_matrix"][np.ix_(stop_indices, stop_indices)]
+    start_to_stop = route_model["start_to_stop_dur"][vehicle:vehicle + 1, stop_indices]
+    stop_to_end = None
+    if route_model["end_policy"] != "open":
+        stop_to_end = route_model["stop_to_end_dur"][stop_indices, vehicle][:, np.newaxis]
 
-    mgr = pywrapcp.RoutingIndexManager(n+1, 1, 0)
+    full, starts, ends = _build_ortools_data_model(
+        sub_cost, start_to_stop, stop_to_end, 1, route_model["cap_stops"],
+        route_model["end_policy"])
+
+    mgr = pywrapcp.RoutingIndexManager(len(full), 1, starts, ends)
     mdl = pywrapcp.RoutingModel(mgr)
-    cb  = mdl.RegisterTransitCallback(
+    cb = mdl.RegisterTransitCallback(
         lambda i, j: int(full[mgr.IndexToNode(i)][mgr.IndexToNode(j)]))
     mdl.SetArcCostEvaluatorOfAllVehicles(cb)
 
@@ -656,188 +1033,152 @@ def _ortools_tsp_cluster(indices, cost_matrix, time_limit_s=4):
     params.time_limit.seconds = time_limit_s
 
     sol = mdl.SolveWithParameters(params)
-    if sol:
-        idx = mdl.Start(0); route = []
-        while not mdl.IsEnd(idx):
-            node = mgr.IndexToNode(idx)
-            if node != 0: route.append(node - 1)
-            idx = sol.Value(mdl.NextVar(idx))
-        # Note: this computes closed-tour cost for reference only.
-        # Actual road route time/distance comes from OSRM /route/ in the run block.
-        length = sum(sub[route[i], route[(i+1)%len(route)]] for i in range(len(route))) / SCALE
-        return route, float(length)
-    # fallback NN
-    vis = [False]*n; r = [0]; vis[0] = True
-    for _ in range(n-1):
-        d = sub[r[-1]].astype(float); d[np.array(vis)] = np.inf
-        nxt = int(d.argmin()); r.append(nxt); vis[nxt] = True
-    return r, sum(sub[r[i], r[(i+1)%n]] for i in range(n)) / SCALE
+    if not sol:
+        order, _ = heuristic_sequence_route(stop_indices, vehicle, route_model)
+        return order, compute_vehicle_path_cost(order, vehicle, route_model)
+
+    local_order = []
+    idx = mdl.Start(0)
+    while not mdl.IsEnd(idx):
+        node = mgr.IndexToNode(idx)
+        if node < len(stop_indices):
+            local_order.append(node)
+        idx = sol.Value(mdl.NextVar(idx))
+
+    order = [stop_indices[i] for i in local_order]
+    return order, compute_vehicle_path_cost(order, vehicle, route_model)
 
 
-def run_pipeline_c(pts_ll, K, cap_pct, cost_matrix, time_limit_s=8):
+def run_pipeline_c(labels, centers, route_model, time_limit_s=8):
     """
-    Pipeline C: MCF assignment (same zones as A) + OR-Tools TSP per cluster.
-    OR-Tools finds a better stop visit order than OSRM's heuristic.
-    Returns (labels, centers, local_routes, ordered_global_idx).
-      local_routes       : {k: [local 0-based indices in OR-Tools visit order]}
-      ordered_global_idx : {k: [original point indices in visit order]}
-                           Use these for OSRM geometry — order matters.
+    Pipeline C: same assignment as A, but sequenced with OR-Tools path routing.
     """
-    labels, centers = run_mcf(pts_ll, K, cap_pct, cost_matrix)
-    local_routes, ordered_global = {}, {}
-    # Divide budget across clusters; minimum 2s each. OR-Tools exits early on convergence.
-    per_cluster = max(2, time_limit_s // max(K, 1))
-    for k in range(K):
-        m = labels == k
-        if not m.any():
-            local_routes[k] = []; ordered_global[k] = []; continue
-        global_idx = list(np.where(m)[0])          # original indices of cluster k
-        local_route, _ = _ortools_tsp_cluster(global_idx, cost_matrix,
-                                               time_limit_s=per_cluster)
-        local_routes[k]   = local_route
-        # Map local route order back to original point indices
-        ordered_global[k] = [global_idx[i] for i in local_route]
-    return labels, centers, local_routes, ordered_global
+    ordered_global, per_vehicle_cost = {}, {}
+    per_cluster = max(2, time_limit_s // max(route_model["K"], 1))
+    for k in range(route_model["K"]):
+        stop_indices = list(np.where(labels == k)[0])
+        order, cost = solve_single_vehicle_path(
+            stop_indices, k, route_model, time_limit_s=per_cluster)
+        ordered_global[k] = order
+        per_vehicle_cost[k] = cost
+    return labels.copy(), centers.copy(), ordered_global, per_vehicle_cost
 
 
 # ──────────────────────────────────────────────────────
 #  PIPELINE D — Full OR-Tools CVRP
 #  Single-stage: assignment + routing solved simultaneously.
-#  Supports multiple depot modes and open/closed route types.
+#  Supports explicit start nodes and explicit end-mode choices.
 # ──────────────────────────────────────────────────────
 
-def _build_ortools_data_model(pts_n, cost_matrix, K, cap, depot_mode, route_mode):
+def _build_ortools_data_model(customer_cost, start_to_stop, stop_to_end, K, cap,
+                              end_mode):
     """
-    Build the (n+K) × (n+K) cost matrix for OR-Tools CVRP.
+    Build the augmented OR-Tools graph for explicit starts and explicit end mode.
 
-    Depot modeling:
-      "centroid"  — shared geographic centroid appended as node n.
-                    All K vehicles start/end at the same point.
-      "seeded"    — K per-van start positions from MCF cluster centers.
-                    Each vehicle v starts at node n+v (its cluster center).
-      "random"    — K random start positions within the bounding box.
-                    Each vehicle v starts at node n+v.
+    Node layout:
+      0 .. n-1        = customer stops
+      n .. n+K-1      = per-vehicle start nodes
+      n+K .. n+2K-1   = per-vehicle end nodes when needed
 
-    Route type:
-      "open"      — vehicles don't need to return to start. Modeled by setting
-                    all arcs FROM any depot/start to cost 0 in the return direction.
-                    In OR-Tools, we add dummy end nodes with zero-cost arcs.
-      "closed"    — vehicles return to their start node (standard CVRP).
-
-    Returns (full_matrix, starts, ends, n_nodes).
+    end_mode:
+      "return_to_start"  -> end at the same start node
+      "return_to_depot"  -> end at a shared depot location
+      "open"             -> dummy zero-cost end node
     """
-    n = len(pts_n)
-    SCALE = 100_000
-    scaled = (cost_matrix * SCALE).astype(int)
+    del cap  # capacity is enforced by OR-Tools dimensions, not by the matrix itself
 
-    if depot_mode == "centroid":
-        # One shared depot at geographic centroid.
-        # Node layout: stops = 0..n-1, depot = n  (same as seeded/random)
-        # This ensures the extraction loop "if node < n" works consistently.
-        depot_n = pts_n.mean(0)
-        nearest_to_depot = int(np.linalg.norm(pts_n - depot_n, axis=1).argmin())
-        depot_dists = (cost_matrix[nearest_to_depot] * SCALE).astype(int)
-        # (n+1) × (n+1): stops at 0..n-1, depot at n
-        full = np.zeros((n+1, n+1), dtype=int)
-        full[:n, :n] = scaled           # stop → stop
-        full[n, :n]  = depot_dists      # depot → stop
-        full[:n, n]  = depot_dists      # stop → depot
-        starts = [n] * K               # all vehicles start at node n (depot)
-        if route_mode == "open":
-            # Add K dummy end nodes (n+1 .. n+K) with zero-cost arcs from any stop
-            m = n + 1 + K
-            big = np.zeros((m, m), dtype=int)
-            big[:n+1, :n+1] = full
-            ends = list(range(n+1, m))
-            return big, [n]*K, ends, m
-        else:
-            ends = [n] * K             # return to shared depot
-            return full, starts, ends, n+1
+    n = customer_cost.shape[0]
+    scale = 100_000
+    cust = np.round(customer_cost * scale).astype(int)
+    start_block = np.round(start_to_stop * scale).astype(int)
+    end_block = None if stop_to_end is None else np.round(stop_to_end * scale).astype(int)
 
-    elif depot_mode in ("seeded", "random"):
-        # K separate depot nodes: node n = depot_0, n+1 = depot_1, ...
-        if depot_mode == "seeded":
-            # Use actual MCF assignment to seed per-van start positions.
-            # This ensures the depot aligns with the same cluster structure
-            # that MCF would produce — not a fresh independent KMeans fit.
-            _seed_labels, _seed_centers = run_mcf(
-                # rebuild pts_ll from pts_n (we don't have pts_ll here)
-                # approximation: use centroid of each cluster in pts_n space
-                np.column_stack([pts_n[:,0], pts_n[:,1]]),   # dummy pts_ll
-                K, 130, cost_matrix)
-            depot_positions = _seed_centers  # (K, 2) in normalised space
-        else:
-            rng = np.random.default_rng(42)
-            depot_positions = rng.uniform(0, 1, (K, 2))
+    max_cost = max(
+        int(np.max(cust)) if cust.size else 1,
+        int(np.max(start_block)) if start_block.size else 1,
+        int(np.max(end_block)) if end_block is not None and end_block.size else 1,
+    )
+    big_m = max(1_000_000, max_cost * 100 + 1)
+    start_nodes = list(range(n, n + K))
 
-        # Depot↔stop costs: for each synthetic depot position, find nearest real point
-        # and use its row in the cost_matrix as the proxy — stays in OSRM units.
-        depot_to_stop = np.zeros((K, n), dtype=int)
-        for d_idx, dp in enumerate(depot_positions):
-            nearest = int(np.linalg.norm(pts_n - dp, axis=1).argmin())
-            depot_to_stop[d_idx] = (cost_matrix[nearest] * SCALE).astype(int)
-        depot_to_depot = np.zeros((K, K), dtype=int)
+    if end_mode == "return_to_start":
+        full = np.full((n + K, n + K), big_m, dtype=int)
+        full[:n, :n] = cust
+        for v, s_node in enumerate(start_nodes):
+            full[s_node, :n] = start_block[v]
+            full[:n, s_node] = end_block[:, v]
+            full[s_node, s_node] = 0
+        return full, start_nodes, start_nodes[:]
 
-        n_nodes = n + K
-        full = np.zeros((n_nodes, n_nodes), dtype=int)
-        full[:n, :n] = scaled          # stop → stop
-        for d in range(K):
-            full[n+d, :n]  = depot_to_stop[d]   # depot_d → stop
-            full[:n, n+d]  = depot_to_stop[d]   # stop → depot_d
-        starts = list(range(n, n+K))
+    if end_mode not in ("return_to_depot", "open"):
+        raise ValueError(f"Unknown end_mode: {end_mode}")
 
-        if route_mode == "open":
-            # Add K dummy end nodes
-            m = n_nodes + K
-            big = np.zeros((m, m), dtype=int)
-            big[:n_nodes, :n_nodes] = full
-            ends = list(range(n_nodes, m))
-            return big, starts, ends, m
-        else:
-            ends = starts[:]   # return to own start
-            return full, starts, ends, n_nodes
+    end_nodes = list(range(n + K, n + 2 * K))
+    full = np.full((n + 2 * K, n + 2 * K), big_m, dtype=int)
+    full[:n, :n] = cust
 
-    raise ValueError(f"Unknown depot_mode: {depot_mode}")
+    for v, s_node in enumerate(start_nodes):
+        full[s_node, :n] = start_block[v]
+        full[s_node, end_nodes[v]] = 0
+        full[s_node, s_node] = 0
+
+    for v, e_node in enumerate(end_nodes):
+        full[e_node, e_node] = 0
+        full[:n, e_node] = 0 if end_mode == "open" else end_block[:, v]
+
+    return full, start_nodes, end_nodes
 
 
-def run_pipeline_d(pts_ll, K, cap_pct, cost_matrix, time_limit_s=15,
-                   depot_mode="centroid", route_mode="closed"):
+def _build_route_sequence(start_ll, stop_nodes, pts_ll, end_ll=None):
+    if len(stop_nodes) == 0:
+        if end_ll is None or np.allclose(start_ll, end_ll):
+            return np.array([start_ll], dtype=float)
+        return np.vstack([start_ll, end_ll]).astype(float)
+
+    seq = [np.asarray(start_ll, dtype=float)[np.newaxis, :], pts_ll[stop_nodes]]
+    if end_ll is not None:
+        seq.append(np.asarray(end_ll, dtype=float)[np.newaxis, :])
+    return np.vstack(seq).astype(float)
+
+
+def run_pipeline_d(pts_ll, route_model, time_limit_s=15):
     """
-    Pipeline D: Full OR-Tools CVRP — integrated single-stage benchmark.
-    OR-Tools decides which van serves which stop AND in what order simultaneously.
+    Pipeline D: Full OR-Tools CVRP with the shared route model.
+    OR-Tools decides assignment and visit order simultaneously.
 
-    Args:
-      depot_mode : "centroid" | "seeded" | "random"
-      route_mode : "closed" (return to start) | "open" (finish anywhere)
-
-    Returns (labels, centers, ordered_global_idx).
-      labels             : (n,) van index per stop
-      centers            : (K,2) normalized cluster centers
-      ordered_global_idx : {v: [original point indices in OR-Tools visit order]}
-                           These are the ACTUAL solved routes — use for OSRM geometry.
+    Returns (labels, centers, ordered_global_idx, route_lonlat_by_vehicle, meta).
+      labels                 : (n,) van index per stop
+      centers                : (K,2) normalized customer centroids
+      ordered_global_idx     : {v: [customer indices in solved visit order]}
+      route_lonlat_by_vehicle: {v: lon/lat sequence including start/end when used}
+      meta                   : route/start-end metadata for display and diagnostics
     """
-    n     = len(pts_ll)
-    d_cap = min(cap_pct, 115)  # CVRP needs tighter cap to balance well
-    cap   = int(np.ceil(n / K * d_cap / 100))
-    pts_bbox = (pts_ll[:,0].min(), pts_ll[:,1].min(),
-                pts_ll[:,0].max(), pts_ll[:,1].max())
+    n = len(pts_ll)
+    K = route_model["K"]
+    cap = route_model["cap_stops"]
+    pts_bbox = (pts_ll[:, 0].min(), pts_ll[:, 1].min(),
+                pts_ll[:, 0].max(), pts_ll[:, 1].max())
     pts_n = norm(pts_ll, pts_bbox)
+    starts_ll = route_model["starts_ll"]
+    ends_ll = route_model["ends_ll"]
+    stop_to_end = None if route_model["end_policy"] == "open" else route_model["stop_to_end_dur"]
 
-    full_mat, starts, ends, n_nodes = _build_ortools_data_model(
-        pts_n, cost_matrix, K, cap, depot_mode, route_mode)
+    full_mat, starts, ends = _build_ortools_data_model(
+        route_model["cost_matrix"], route_model["start_to_stop_dur"],
+        stop_to_end, K, cap, route_model["end_policy"])
 
-    mgr = pywrapcp.RoutingIndexManager(n_nodes, K, starts, ends)
+    mgr = pywrapcp.RoutingIndexManager(len(full_mat), K, starts, ends)
     mdl = pywrapcp.RoutingModel(mgr)
 
-    # Arc cost: route through the full_mat
     cb = mdl.RegisterTransitCallback(
         lambda i, j: int(full_mat[mgr.IndexToNode(i)][mgr.IndexToNode(j)]))
     mdl.SetArcCostEvaluatorOfAllVehicles(cb)
 
-    # Capacity: only real stops (indices 0..n-1) have demand 1; depot/dummy nodes = 0
-    dcb = mdl.RegisterUnaryTransitCallback(
-        lambda i: 1 if mgr.IndexToNode(i) < n else 0)
-    mdl.AddDimensionWithVehicleCapacity(dcb, 0, [cap]*K, True, 'Capacity')
+    dcb = mdl.RegisterUnaryTransitCallback(lambda i: 1 if mgr.IndexToNode(i) < n else 0)
+    mdl.AddDimensionWithVehicleCapacity(dcb, 0, [cap] * K, True, "Capacity")
+    cap_dim = mdl.GetDimensionOrDie("Capacity")
+    for v in range(K):
+        mdl.solver().Add(cap_dim.CumulVar(mdl.End(v)) >= 1)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -846,31 +1187,514 @@ def run_pipeline_d(pts_ll, K, cap_pct, cost_matrix, time_limit_s=15,
 
     sol = mdl.SolveWithParameters(params)
 
-    labels  = np.zeros(n, dtype=int)
+    labels = np.zeros(n, dtype=int)
     centers = np.zeros((K, 2))
-    ordered_global = {}   # {v: [original point indices in visit order]}
+    ordered_global = {}
+    route_lonlat = {}
 
     if sol:
         for v in range(K):
-            idx = mdl.Start(v); stop_nodes = []
+            idx = mdl.Start(v)
+            stop_nodes = []
             while not mdl.IsEnd(idx):
                 node = mgr.IndexToNode(idx)
-                if node < n:  # only real stops, skip depots/dummy nodes
+                if node < n:
                     stop_nodes.append(node)
                     labels[node] = v
                 idx = sol.Value(mdl.NextVar(idx))
-            # stop_nodes IS already in OR-Tools visit order — preserve it
             ordered_global[v] = stop_nodes
+            route_lonlat[v] = _build_route_sequence(
+                starts_ll[v], stop_nodes, pts_ll,
+                None if ends_ll is None else ends_ll[v])
             if stop_nodes:
                 centers[v] = pts_n[stop_nodes].mean(0)
     else:
-        # Fallback: MCF assignment with trivial ordering
-        labels, centers = run_mcf(pts_ll, K, cap_pct, cost_matrix)
+        labels, centers, _ = run_mcf(
+            pts_ll, K, route_model["cap_pct"], route_model["cost_matrix"],
+            return_meta=True)
         for v in range(K):
-            ordered_global[v] = list(np.where(labels == v)[0])
+            stop_nodes = list(np.where(labels == v)[0])
+            ordered_global[v] = stop_nodes
+            route_lonlat[v] = _build_route_sequence(
+                starts_ll[v], stop_nodes, pts_ll,
+                None if ends_ll is None else ends_ll[v])
 
-    labels, centers = fix_empty(pts_n, labels, centers, K)
-    return labels, centers, ordered_global
+    meta = {
+        "start_policy": route_model["start_policy"],
+        "end_policy": route_model["end_policy"],
+        "start_lonlat": starts_ll,
+        "end_lonlat": ends_ll,
+        "shared_depot_lonlat": route_model["shared_depot_ll"],
+        "start_end_osrm_exact": bool(route_model["terminal_costs_exact"]),
+    }
+    return labels, centers, ordered_global, route_lonlat, meta
+
+
+def build_route_sequences_from_orders(pts_ll, ordered_global, route_model):
+    route_lonlat = {}
+    for v in range(route_model["K"]):
+        stop_nodes = ordered_global.get(v, [])
+        route_lonlat[v] = _build_route_sequence(
+            route_model["starts_ll"][v],
+            stop_nodes,
+            pts_ll,
+            None if route_model["end_policy"] == "open" else route_model["ends_ll"][v],
+        )
+    return route_lonlat
+
+
+def _fmt_lonlat(ll):
+    if ll is None:
+        return "None"
+    return f"{float(ll[0]):.5f}, {float(ll[1]):.5f}"
+
+
+def build_pipeline_summary(assignment_method: str, sequencing_method: str,
+                           integration_mode: str, assignment_cost_basis: str,
+                           route_model: dict, capacity_treatment: str,
+                           intended_use: str, road_network_usage: str | None = None):
+    end_label = {
+        "open": "open path",
+        "return_to_start": "fixed start -> return to start",
+        "return_to_depot": "fixed start -> shared depot",
+    }[route_model["end_policy"]]
+    return {
+        "assignment_method": assignment_method,
+        "sequencing_method": sequencing_method,
+        "integration_mode": integration_mode,
+        "assignment_cost_basis": assignment_cost_basis,
+        "routing_cost_basis": route_model["routing_cost_basis"],
+        "road_network_usage": road_network_usage or (
+            "assignment uses OSRM customer matrix; routing uses OSRM route geometry "
+            "with the shared start/end model"
+        ),
+        "route_model": end_label,
+        "capacity_treatment": capacity_treatment,
+        "intended_use": intended_use,
+    }
+
+
+def build_route_logs(letter, labels, ordered_global, route_dist, route_dur,
+                     assignment_cost_per_vehicle, route_model_cost_per_vehicle,
+                     route_model, validation):
+    rows = []
+    val_map = validation.get("vehicle_feasible", {})
+    for v in range(route_model["K"]):
+        order = ordered_global.get(v, [])
+        rows.append({
+            "pipeline": letter,
+            "van": v + 1,
+            "assignment_cost_s": round(float(assignment_cost_per_vehicle.get(v, 0.0)), 2),
+            "routing_cost_s": round(float(route_model_cost_per_vehicle.get(v, 0.0)), 2),
+            "ordered_stops": ",".join(str(int(i)) for i in order),
+            "start_node": _fmt_lonlat(route_model["starts_ll"][v]),
+            "end_node": _fmt_lonlat(None if route_model["end_policy"] == "open" else route_model["ends_ll"][v]),
+            "total_demand": round(len(order) * route_model["demand_per_stop"], 2),
+            "capacity": round(route_model["capacity_units"], 2),
+            "road_km": round(float(route_dist.get(v, 0.0)) / 1000.0, 3),
+            "drive_min": round(float(route_dur.get(v, 0.0)) / 60.0, 2),
+            "open_route": route_model["end_policy"] == "open",
+            "feasible": bool(val_map.get(v, True)),
+        })
+    return rows
+
+
+def validate_pipeline_result(labels, ordered_global, route_sequences, route_model):
+    checks = []
+    vehicle_feasible = {}
+    n = route_model["n"]
+    K = route_model["K"]
+
+    checks.append({
+        "check": "customer matrix dimensions",
+        "ok": route_model["cost_matrix"].shape == (n, n),
+        "detail": f"{route_model['cost_matrix'].shape} vs expected {(n, n)}",
+    })
+    checks.append({
+        "check": "start-stop matrix dimensions",
+        "ok": route_model["start_to_stop_dur"].shape == (K, n),
+        "detail": f"{route_model['start_to_stop_dur'].shape} vs expected {(K, n)}",
+    })
+    checks.append({
+        "check": "stop-end matrix dimensions",
+        "ok": route_model["stop_to_end_dur"].shape == (n, K),
+        "detail": f"{route_model['stop_to_end_dur'].shape} vs expected {(n, K)}",
+    })
+    checks.append({
+        "check": "cost scale consistency",
+        "ok": route_model["scale_ratio"] < 1000,
+        "detail": f"terminal/stop median ratio={route_model['scale_ratio']:.2f}",
+    })
+
+    route_seen = []
+    for v in range(K):
+        assigned = list(np.where(labels == v)[0])
+        ordered = list(map(int, ordered_global.get(v, [])))
+        seq = np.asarray(route_sequences.get(v, np.empty((0, 2))), dtype=float)
+        ok = True
+        detail = []
+
+        if len(ordered) != len(set(ordered)):
+            ok = False
+            detail.append("duplicate stops in order")
+        if sorted(ordered) != sorted(assigned):
+            ok = False
+            detail.append("route order does not match assigned stops")
+        if len(seq) > 0 and not np.allclose(seq[0], route_model["starts_ll"][v]):
+            ok = False
+            detail.append("missing configured start")
+        if route_model["end_policy"] == "open":
+            if len(seq) >= 2 and np.allclose(seq[0], seq[-1]):
+                ok = False
+                detail.append("open route closes back to start")
+        else:
+            if len(seq) == 0 or not np.allclose(seq[-1], route_model["ends_ll"][v]):
+                ok = False
+                detail.append("missing configured end")
+            if route_model["end_policy"] == "return_to_start" and len(seq) >= 2:
+                if not np.allclose(seq[0], seq[-1]):
+                    ok = False
+                    detail.append("expected roundtrip to same start")
+        demand_total = len(ordered) * route_model["demand_per_stop"]
+        if demand_total > route_model["capacity_units"] + 1e-9:
+            ok = False
+            detail.append("capacity violation")
+        vehicle_feasible[v] = ok
+        route_seen.extend(ordered)
+
+    seen_sorted = sorted(route_seen)
+    checks.append({
+        "check": "all stops assigned exactly once",
+        "ok": seen_sorted == list(range(n)),
+        "detail": f"seen={len(route_seen)} unique={len(set(route_seen))} expected={n}",
+    })
+    checks.append({
+        "check": "all vehicle routes feasible",
+        "ok": all(vehicle_feasible.values()) if vehicle_feasible else False,
+        "detail": ", ".join(f"V{v+1}={'ok' if ok else 'fail'}" for v, ok in vehicle_feasible.items()),
+    })
+
+    feasible = all(check["ok"] for check in checks)
+    return {"feasible": feasible, "checks": checks, "vehicle_feasible": vehicle_feasible}
+
+
+def build_integrity_row(letter, summary, route_model, validation):
+    return {
+        "Pipeline": letter,
+        "Start Policy": route_model["start_policy"],
+        "End Policy": route_model["end_policy"],
+        "Roundtrip": bool(route_model["roundtrip"]),
+        "Capacity Enforced": True,
+        "Assignment Cost Basis": summary["assignment_cost_basis"],
+        "Routing Cost Basis": summary["routing_cost_basis"],
+        "Feasible": bool(validation["feasible"]),
+    }
+
+
+def _json_ready(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, dict):
+        return {str(k): _json_ready(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_ready(v) for v in obj]
+    return obj
+
+
+def matrix_stats(mat):
+    if mat is None:
+        return None
+    arr = np.asarray(mat, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return {"shape": list(arr.shape), "finite_count": 0}
+    return {
+        "shape": list(arr.shape),
+        "finite_count": int(finite.size),
+        "min": round(float(finite.min()), 6),
+        "max": round(float(finite.max()), 6),
+        "mean": round(float(finite.mean()), 6),
+        "median": round(float(np.median(finite)), 6),
+    }
+
+
+def _assignment_stop_detail(stop_idx: int, assigned_vehicle: int,
+                            assignment_meta: dict, route_model: dict):
+    detail = {
+        "assignment_anchor_type": None,
+        "assignment_anchor_index": None,
+        "assignment_stage_cost_s": None,
+    }
+    if "seed_indices" in assignment_meta and len(assignment_meta["seed_indices"]) > assigned_vehicle:
+        anchor = int(assignment_meta["seed_indices"][assigned_vehicle])
+        detail.update({
+            "assignment_anchor_type": "seed_stop",
+            "assignment_anchor_index": anchor,
+            "assignment_stage_cost_s": round(float(route_model["cost_matrix"][stop_idx, anchor]), 6),
+        })
+    elif "median_indices" in assignment_meta and len(assignment_meta["median_indices"]) > assigned_vehicle:
+        anchor = int(assignment_meta["median_indices"][assigned_vehicle])
+        detail.update({
+            "assignment_anchor_type": "median_stop",
+            "assignment_anchor_index": anchor,
+            "assignment_stage_cost_s": round(float(route_model["cost_matrix"][stop_idx, anchor]), 6),
+        })
+    return detail
+
+
+def build_vehicle_leg_trace(vehicle: int, order: list[int], route_model: dict):
+    legs = []
+    if not order:
+        return legs
+
+    start_ll = route_model["starts_ll"][vehicle]
+    first = int(order[0])
+    legs.append({
+        "leg": 1,
+        "from_type": "start",
+        "from_id": f"start_{vehicle+1}",
+        "from_lonlat": _json_ready(start_ll),
+        "to_type": "stop",
+        "to_id": first,
+        "to_lonlat": _json_ready(route_model["points_ll"][first]),
+        "cost_s": round(float(route_model["start_to_stop_dur"][vehicle, first]), 6),
+    })
+
+    leg_no = 2
+    for prev_stop, next_stop in zip(order[:-1], order[1:]):
+        prev_stop = int(prev_stop)
+        next_stop = int(next_stop)
+        legs.append({
+            "leg": leg_no,
+            "from_type": "stop",
+            "from_id": prev_stop,
+            "from_lonlat": _json_ready(route_model["points_ll"][prev_stop]),
+            "to_type": "stop",
+            "to_id": next_stop,
+            "to_lonlat": _json_ready(route_model["points_ll"][next_stop]),
+            "cost_s": round(float(route_model["cost_matrix"][prev_stop, next_stop]), 6),
+        })
+        leg_no += 1
+
+    if route_model["end_policy"] != "open":
+        last = int(order[-1])
+        legs.append({
+            "leg": leg_no,
+            "from_type": "stop",
+            "from_id": last,
+            "from_lonlat": _json_ready(route_model["points_ll"][last]),
+            "to_type": "end",
+            "to_id": f"end_{vehicle+1}",
+            "to_lonlat": _json_ready(route_model["ends_ll"][vehicle]),
+            "cost_s": round(float(route_model["stop_to_end_dur"][last, vehicle]), 6),
+        })
+    return legs
+
+
+def build_pipeline_debug_payload(letter, labels, centers, ordered_global, route_sequences,
+                                 route_dist, route_dur, route_model_cost_per_vehicle,
+                                 assignment_meta, route_model, validation, summary,
+                                 ana, include_full_matrices=False):
+    order_pos = {}
+    for v, order in ordered_global.items():
+        for pos, stop_idx in enumerate(order):
+            order_pos[int(stop_idx)] = (int(v), int(pos))
+
+    stop_details = []
+    for stop_idx in range(route_model["n"]):
+        v = int(labels[stop_idx])
+        pos = order_pos.get(stop_idx, (v, None))[1]
+        order = ordered_global.get(v, [])
+        prev_stop = int(order[pos - 1]) if pos is not None and pos > 0 else None
+        next_stop = int(order[pos + 1]) if pos is not None and pos < len(order) - 1 else None
+        in_cost = (float(route_model["start_to_stop_dur"][v, stop_idx]) if pos == 0
+                   else float(route_model["cost_matrix"][prev_stop, stop_idx]) if prev_stop is not None
+                   else None)
+        if next_stop is not None:
+            out_cost = float(route_model["cost_matrix"][stop_idx, next_stop])
+        elif route_model["end_policy"] != "open" and pos is not None:
+            out_cost = float(route_model["stop_to_end_dur"][stop_idx, v])
+        else:
+            out_cost = None
+        stop_details.append({
+            "stop_idx": int(stop_idx),
+            "stop_lonlat": _json_ready(route_model["points_ll"][stop_idx]),
+            "assigned_vehicle": v + 1,
+            "route_position": None if pos is None else pos + 1,
+            "demand": round(float(route_model["demand_per_stop"]), 6),
+            "model_inbound_cost_s": None if in_cost is None else round(in_cost, 6),
+            "model_outbound_cost_s": None if out_cost is None else round(out_cost, 6),
+            "previous_stop": prev_stop,
+            "next_stop": next_stop,
+            **_assignment_stop_detail(stop_idx, v, assignment_meta, route_model),
+        })
+
+    vehicles = []
+    for v in range(route_model["K"]):
+        order = list(map(int, ordered_global.get(v, [])))
+        vehicles.append({
+            "vehicle": v + 1,
+            "start_lonlat": _json_ready(route_model["starts_ll"][v]),
+            "end_lonlat": None if route_model["end_policy"] == "open" else _json_ready(route_model["ends_ll"][v]),
+            "ordered_stops": order,
+            "total_demand": round(float(len(order) * route_model["demand_per_stop"]), 6),
+            "capacity": round(float(route_model["capacity_units"]), 6),
+            "model_route_cost_s": round(float(route_model_cost_per_vehicle.get(v, 0.0)), 6),
+            "road_distance_m": round(float(route_dist.get(v, 0.0)), 6),
+            "road_duration_s": round(float(route_dur.get(v, 0.0)), 6),
+            "feasible": bool(validation.get("vehicle_feasible", {}).get(v, False)),
+            "leg_trace": build_vehicle_leg_trace(v, order, route_model),
+            "route_sequence_lonlat": _json_ready(np.asarray(route_sequences.get(v, np.empty((0, 2))), dtype=float)),
+        })
+
+    payload = {
+        "pipeline": letter,
+        "summary": _json_ready(summary),
+        "metrics": {
+            "assignment_cost_total_s": round(float(ana.get("assignment_cost_total_s", 0.0)), 6),
+            "model_route_cost_total_s": round(float(ana.get("routing_cost_total_s", 0.0)), 6),
+            "road_duration_total_s": round(float(ana.get("total_dur_s", 0.0)), 6),
+            "road_distance_total_m": round(float(ana.get("total_dist_m", 0.0)), 6),
+            "feasible": bool(ana.get("feasible", False)),
+        },
+        "assignment_meta": _json_ready(assignment_meta),
+        "labels": _json_ready(labels),
+        "centers_normalized": _json_ready(centers),
+        "ordered_global": _json_ready(ordered_global),
+        "validation": _json_ready(validation),
+        "vehicle_routes": vehicles,
+        "stop_details": stop_details,
+    }
+
+    if include_full_matrices:
+        payload["customer_cost_matrix_s"] = _json_ready(route_model["cost_matrix"])
+        if "seed_indices" in assignment_meta:
+            payload["assignment_anchor_matrix_s"] = _json_ready(
+                route_model["cost_matrix"][:, assignment_meta["seed_indices"]]
+            )
+        elif "median_indices" in assignment_meta:
+            payload["assignment_anchor_matrix_s"] = _json_ready(
+                route_model["cost_matrix"][:, assignment_meta["median_indices"]]
+            )
+    return payload
+
+
+def build_benchmark_debug_report(config, route_model, pipelines_payload,
+                                 dist_matrix=None, include_full_matrices=False):
+    report = {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "config": _json_ready(config),
+        "route_model": {
+            "start_policy": route_model["start_policy"],
+            "end_policy": route_model["end_policy"],
+            "roundtrip": bool(route_model["roundtrip"]),
+            "capacity_units": round(float(route_model["capacity_units"]), 6),
+            "demand_per_stop": round(float(route_model["demand_per_stop"]), 6),
+            "routing_cost_basis": route_model["routing_cost_basis"],
+            "terminal_costs_exact": bool(route_model["terminal_costs_exact"]),
+            "starts_ll": _json_ready(route_model["starts_ll"]),
+            "ends_ll": _json_ready(route_model["ends_ll"]),
+            "shared_depot_ll": _json_ready(route_model["shared_depot_ll"]),
+            "matrix_stats": {
+                "customer_cost_s": matrix_stats(route_model["cost_matrix"]),
+                "customer_distance_m": matrix_stats(dist_matrix),
+                "start_to_stop_s": matrix_stats(route_model["start_to_stop_dur"]),
+                "stop_to_end_s": matrix_stats(route_model["stop_to_end_dur"]),
+            },
+        },
+        "pipelines": _json_ready(pipelines_payload),
+        "benchmark_integrity_checks": [],
+    }
+    if include_full_matrices:
+        report["route_model"]["customer_cost_matrix_s"] = _json_ready(route_model["cost_matrix"])
+        report["route_model"]["customer_distance_matrix_m"] = _json_ready(dist_matrix)
+        report["route_model"]["start_to_stop_matrix_s"] = _json_ready(route_model["start_to_stop_dur"])
+        report["route_model"]["stop_to_end_matrix_s"] = _json_ready(route_model["stop_to_end_dur"])
+    return report
+
+
+def render_debug_report_text(report):
+    lines = []
+    lines.append("BENCHMARK TRACE EXPORT")
+    lines.append(f"Generated at: {report.get('generated_at', 'n/a')}")
+    cfg = report.get("config", {})
+    lines.append(
+        f"Config: city={cfg.get('city')} poi={cfg.get('poi_type')} "
+        f"points={cfg.get('n_points_loaded')} vans={cfg.get('n_vans')}"
+    )
+    rm = report.get("route_model", {})
+    lines.append(
+        f"Shared route model: start={rm.get('start_policy')} end={rm.get('end_policy')} "
+        f"roundtrip={rm.get('roundtrip')} demand/stop={rm.get('demand_per_stop')} "
+        f"capacity={rm.get('capacity_units')}"
+    )
+    lines.append(f"Routing cost basis: {rm.get('routing_cost_basis')}")
+    lines.append(f"Terminal start/end costs exact: {rm.get('terminal_costs_exact')}")
+    lines.append(f"Starts: {rm.get('starts_ll')}")
+    if rm.get("ends_ll") is not None:
+        lines.append(f"Ends: {rm.get('ends_ll')}")
+    matrix_stats_payload = rm.get("matrix_stats", {})
+    if matrix_stats_payload:
+        lines.append("Matrix stats:")
+        for key, stats in matrix_stats_payload.items():
+            lines.append(f"  {key}: {stats}")
+    lines.append("")
+
+    for letter, payload in report.get("pipelines", {}).items():
+        lines.append(f"PIPELINE {letter}")
+        summary = payload.get("summary", {})
+        metrics = payload.get("metrics", {})
+        lines.append(f"Assignment: {summary.get('assignment_method')}")
+        lines.append(f"Sequencing: {summary.get('sequencing_method')}")
+        lines.append(f"Mode: {summary.get('integration_mode')}")
+        lines.append(f"Assignment cost basis: {summary.get('assignment_cost_basis')}")
+        lines.append(f"Routing cost basis: {summary.get('routing_cost_basis')}")
+        lines.append(
+            f"Totals: assignment={metrics.get('assignment_cost_total_s')} s · "
+            f"model_route={metrics.get('model_route_cost_total_s')} s · "
+            f"road_time={metrics.get('road_duration_total_s')} s · "
+            f"road_dist={metrics.get('road_distance_total_m')} m · "
+            f"feasible={metrics.get('feasible')}"
+        )
+        lines.append(f"Assignment metadata: {payload.get('assignment_meta')}")
+        lines.append("Validation:")
+        for check in payload.get("validation", {}).get("checks", []):
+            lines.append(f"  - {check.get('check')}: {check.get('ok')} ({check.get('detail')})")
+        lines.append("Vehicles:")
+        for vehicle in payload.get("vehicle_routes", []):
+            lines.append(
+                f"  Van {vehicle.get('vehicle')}: stops={vehicle.get('ordered_stops')} "
+                f"model={vehicle.get('model_route_cost_s')} s road={vehicle.get('road_duration_s')} s "
+                f"dist={vehicle.get('road_distance_m')} m feasible={vehicle.get('feasible')}"
+            )
+            lines.append(f"    start={vehicle.get('start_lonlat')} end={vehicle.get('end_lonlat')}")
+            for leg in vehicle.get("leg_trace", []):
+                lines.append(
+                    f"    leg {leg.get('leg')}: {leg.get('from_type')} {leg.get('from_id')} -> "
+                    f"{leg.get('to_type')} {leg.get('to_id')} = {leg.get('cost_s')} s"
+                )
+        lines.append("Stops:")
+        for stop in payload.get("stop_details", []):
+            lines.append(
+                f"  stop {stop.get('stop_idx')}: van={stop.get('assigned_vehicle')} "
+                f"pos={stop.get('route_position')} assignment={stop.get('assignment_stage_cost_s')} s "
+                f"in={stop.get('model_inbound_cost_s')} s out={stop.get('model_outbound_cost_s')} s "
+                f"prev={stop.get('previous_stop')} next={stop.get('next_stop')}"
+            )
+        lines.append("")
+    integrity_rows = report.get("benchmark_integrity_checks", [])
+    if integrity_rows:
+        lines.append("BENCHMARK INTEGRITY CHECKS")
+        for row in integrity_rows:
+            lines.append(str(row))
+        lines.append("")
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────
@@ -1052,6 +1876,8 @@ for k, v in [
     ("result_c", None), ("result_d", None),
     ("gif_a", None), ("gif_b", None),
     ("gif_c", None), ("gif_d", None),
+    ("route_start_policy_used", "seeded"), ("route_end_policy_used", "open"),
+    ("debug_report", None), ("debug_report_text", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -1089,8 +1915,8 @@ with st.sidebar:
     st.divider()
 
     col1, col2 = st.columns(2)
-    fetch_btn = col1.button("📡 Fetch POIs", use_container_width=True, type="primary")
-    run_btn   = col2.button("🚀 Run", use_container_width=True, type="primary",
+    fetch_btn = col1.button("📡 Fetch POIs", width="stretch", type="primary")
+    run_btn   = col2.button("🚀 Run", width="stretch", type="primary",
                              disabled=st.session_state.ll_pts is None)
 
     if st.session_state.ll_pts is not None:
@@ -1112,21 +1938,27 @@ with st.sidebar:
                                   help="Max stops per van = ⌈(N/K) × buffer/100⌉")
         pm_iters     = st.slider("P-Median Iterations", 10, 80, 30, step=5)
         c_time_limit = st.slider("Pipeline C OR-Tools (s)", 4, 30, 8, step=2,
-                                  help="Time budget for per-cluster TSP optimization")
+                                  help="Time budget for per-cluster path optimization")
         d_time_limit = st.slider("Pipeline D OR-Tools (s)", 8, 60, 15, step=5,
                                   help="Time budget for full CVRP. More = better routes.")
-        st.markdown("**Pipeline D — Route Start/End**")
-        d_depot_mode = st.selectbox("D: Depot mode",
-                                     ["centroid", "seeded", "random"],
-                                     index=0,
-                                     help="centroid=shared depot at geographic centre | "
-                                          "seeded=each van starts at its MCF cluster centre | "
-                                          "random=random start positions within bbox")
-        d_route_mode = st.selectbox("D: Route type",
-                                     ["closed", "open"],
-                                     index=0,
-                                     help="closed=vans return to start | "
-                                          "open=vans finish at last stop (no forced return)")
+        st.markdown("**Shared Route Model**")
+        route_start_policy = st.selectbox(
+            "Route: Start policy",
+            ["seeded", "centroid", "random"],
+            index=0,
+            help="Shared across A/B/C/D. seeded=common geographic van starts, "
+                 "centroid=one shared depot, random=stress-test dispersed starts")
+        route_end_policy = st.selectbox(
+            "Route: End policy",
+            ["open", "return_to_start", "return_to_depot"],
+            index=0,
+            help="Shared across A/B/C/D. open=end at last stop, "
+                 "return_to_start=go back to van origin, "
+                 "return_to_depot=finish at the shared centroid depot")
+        demand_per_stop = st.number_input(
+            "Demand per stop",
+            value=1.0, step=0.5, min_value=0.5, max_value=10.0,
+            help="Uniform demand used by every pipeline for capacity validation")
         st.markdown("**Fuel / Cost Assumptions**")
         fuel_lpk    = st.number_input("Fuel efficiency (L/100 km)", value=8.5, step=0.5,
                                        min_value=1.0, max_value=30.0,
@@ -1136,6 +1968,16 @@ with st.sidebar:
         co2_per_l   = st.number_input("CO₂ per liter (kg)", value=2.68, step=0.1,
                                        min_value=1.0, max_value=4.0,
                                        help="Diesel ≈ 2.68 kg/L · Petrol ≈ 2.31 kg/L")
+        st.markdown("**Audit / Export**")
+        enable_debug_trace = st.checkbox(
+            "Detailed benchmark trace",
+            value=True,
+            help="Capture a full calculation log and enable JSON/TXT export after the run")
+        include_full_matrices = st.checkbox(
+            "Include full matrices in export",
+            value=False,
+            help="Adds full customer/start/end matrices and assignment matrices to the debug export. "
+                 "Can be large for big point sets.")
         anim_frames  = st.slider("Animation Frames", 40, 200, 80, 20)
         anim_fps     = st.slider("Animation FPS", 10, 30, 20)
         trail_len    = st.slider("Trail Length", 5, 40, 16)
@@ -1165,6 +2007,7 @@ if fetch_btn:
             ("result_c", None), ("result_d", None),
             ("gif_a", None), ("gif_b", None),
             ("gif_c", None), ("gif_d", None),
+            ("debug_report", None), ("debug_report_text", None),
         ]:
             st.session_state[k] = v
         dist_note = " + distances" if dist_mat is not None else " (durations only)"
@@ -1183,157 +2026,213 @@ if run_btn and st.session_state.ll_pts is not None:
     K         = n_vans
     osrm_used = st.session_state.osrm_used
 
-    # Safe defaults if advanced settings expander wasn't opened
-    try:    cap_pct
-    except: cap_pct = 130
-    try:    pm_iters
-    except: pm_iters = 30
-    try:    c_time_limit
-    except: c_time_limit = 8
-    try:    d_time_limit
-    except: d_time_limit = 15
-    try:    anim_frames
-    except: anim_frames = 80
-    try:    anim_fps
-    except: anim_fps = 20
-    try:    trail_len
-    except: trail_len = 16
-    try:    tile_src
-    except: tile_src = ctx.providers.CartoDB.DarkMatter
+    # Safe defaults without bare expressions that Streamlit would render.
+    cap_pct = int(locals().get("cap_pct", 130))
+    pm_iters = int(locals().get("pm_iters", 30))
+    c_time_limit = int(locals().get("c_time_limit", 8))
+    d_time_limit = int(locals().get("d_time_limit", 15))
+    anim_frames = int(locals().get("anim_frames", 80))
+    anim_fps = int(locals().get("anim_fps", 20))
+    trail_len = int(locals().get("trail_len", 16))
+    tile_src = locals().get("tile_src", ctx.providers.CartoDB.DarkMatter)
 
     pts_bbox = (ll[:,0].min(), ll[:,1].min(), ll[:,0].max(), ll[:,1].max())
     pts_n    = norm(ll, pts_bbox)
     dist_mat = st.session_state.dist_matrix   # may be None if OSRM didn't return distances
 
     # Safe defaults for fuel/depot settings
-    try:    fuel_lpk
-    except: fuel_lpk = 8.5
-    try:    fuel_price
-    except: fuel_price = 2.0
-    try:    co2_per_l
-    except: co2_per_l = 2.68
-    try:    d_depot_mode
-    except: d_depot_mode = "centroid"
-    try:    d_route_mode
-    except: d_route_mode = "closed"
+    fuel_lpk = float(locals().get("fuel_lpk", 8.5))
+    fuel_price = float(locals().get("fuel_price", 2.0))
+    co2_per_l = float(locals().get("co2_per_l", 2.68))
+    route_start_policy = str(locals().get("route_start_policy", "seeded"))
+    route_end_policy = str(locals().get("route_end_policy", "open"))
+    demand_per_stop = float(locals().get("demand_per_stop", 1.0))
+    enable_debug_trace = bool(locals().get("enable_debug_trace", True))
+    include_full_matrices = bool(locals().get("include_full_matrices", False))
 
     def _fuel(dist_km):
         return build_fuel_metrics(dist_km, fuel_lpk, fuel_price, co2_per_l)
 
-    def _route_geom_from_ordered(ordered_global, labels_arr):
-        """
-        Fetch OSRM road geometry using the ACTUAL solved visit order.
-        ordered_global : {v: [original point indices in visit order]}
-        Returns geoms dict {v: [(x_wm, y_wm)]}, route_dist {v: m}, route_dur {v: s}.
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+    route_model = build_shared_route_model(
+        ll, K, cap_pct, mat,
+        start_policy=route_start_policy,
+        end_policy=route_end_policy,
+        demand_per_stop=demand_per_stop,
+    )
 
-        def _fetch_one(args):
-            v, global_idx = args
-            if len(global_idx) < 2:
-                return v, None, 0.0, 0.0
-            ordered_ll = ll[global_idx]
-            # close the loop
-            loop_ll = np.vstack([ordered_ll, ordered_ll[:1]])
-            result = ordered_route_geometry(loop_ll)
-            if result:
-                geom, dist_m, dur_s = result
-                return v, geom, dist_m, dur_s
-            return v, None, 0.0, 0.0
-
-        tasks = [(v, idx) for v, idx in ordered_global.items() if len(idx) >= 2]
-        geoms, rdist, rdur = {}, {}, {}
-        with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
-            futs = {pool.submit(_fetch_one, t): t[0] for t in tasks}
-            for fut in as_completed(futs):
-                v, geom, dist_m, dur_s = fut.result()
-                rdist[v] = dist_m; rdur[v] = dur_s
-                if geom: geoms[v] = geom
-        return geoms, rdist, rdur
+    def _finalize_pipeline(letter, title, ana_name, labels, centers, ordered_global,
+                           route_model_cost_per_vehicle, assignment_meta,
+                           summary, elapsed_s, route_sequences=None):
+        if route_sequences is None:
+            route_sequences = build_route_sequences_from_orders(ll, ordered_global, route_model)
+        geoms, rdist, rdur, exact_routes = build_route_geometries(
+            route_sequences, close_loop=False)
+        rm = build_route_metrics(
+            rdist, rdur, K,
+            osrm_used and exact_routes and route_model["terminal_costs_exact"])
+        ana = analytics(
+            pts_n, labels, centers, ana_name, elapsed_s,
+            osrm_used=osrm_used,
+            route_metrics=rm,
+            fuel_metrics=_fuel(rm["total_dist_km"]),
+        )
+        validation = validate_pipeline_result(labels, ordered_global, route_sequences, route_model)
+        route_logs = build_route_logs(
+            letter, labels, ordered_global, rdist, rdur,
+            assignment_meta["assignment_cost_per_vehicle"],
+            route_model_cost_per_vehicle, route_model, validation)
+        ana.update({
+            "assignment_cost_total_s": round(float(assignment_meta["assignment_cost_total"]), 2),
+            "routing_cost_total_s": round(float(sum(route_model_cost_per_vehicle.values())), 2),
+            "assignment_cost_basis": assignment_meta["assignment_cost_basis"],
+            "capacity_enforced": bool(assignment_meta.get("capacity_enforced", True)),
+            "capacity_units": route_model["capacity_units"],
+            "demand_per_stop": route_model["demand_per_stop"],
+            "route_start_policy": route_model["start_policy"],
+            "route_end_policy": route_model["end_policy"],
+            "roundtrip": route_model["roundtrip"],
+            "feasible": validation["feasible"],
+            "validation_checks": validation["checks"],
+            "summary": summary,
+            "van_log": route_logs,
+            "integrity_row": build_integrity_row(letter, summary, route_model, validation),
+        })
+        fig = make_map(
+            ll, labels, centers, bbox, title,
+            road_geoms=geoms, tile_src=tile_src, route_model=route_model)
+        trace_ctx = {
+            "route_sequences": route_sequences,
+            "route_dist": rdist,
+            "route_dur": rdur,
+            "validation": validation,
+            "assignment_meta": assignment_meta,
+            "route_model_cost_per_vehicle": route_model_cost_per_vehicle,
+        }
+        return fig, ana, geoms, trace_ctx
 
     prog = st.progress(0, text="Pipeline A — Min-Cost Flow…")
 
-    # ── A: MCF + OSRM Trip ─────────────────────────────────────────────────
+    # ── A: MCF + OSRM matrix path heuristic ────────────────────────────────
     t0 = time.perf_counter()
-    La, Ca_n = run_mcf(ll, K, cap_pct, mat)
-    prog.progress(8, text="Pipeline A — OSRM trip routing…")
-    # fetch_all_routes uses OSRM /trip/ which returns the order it chose
-    routes_a, geoms_a, rdist_a, rdur_a = fetch_all_routes(ll, La, K)
-    # Build ordered_global for A using the OSRM trip order
-    ordered_a = {k: [int(np.where(La==k)[0][i]) for i in routes_a[k]]
-                 for k in range(K) if (La==k).any() and k in routes_a}
+    La, Ca_n, meta_a = run_mcf(ll, K, cap_pct, mat, return_meta=True)
+    La, Ca_n, meta_a, _map_a = realign_labels_to_shared_starts(La, Ca_n, route_model, meta_a)
+    prog.progress(8, text="Pipeline A — fixed-start path sequencing…")
+    ordered_a, path_cost_a = {}, {}
+    for k in range(K):
+        stop_indices = list(np.where(La == k)[0])
+        order, cost = heuristic_sequence_route(stop_indices, k, route_model)
+        ordered_a[k] = order
+        path_cost_a[k] = cost
     ta = time.perf_counter() - t0
-    rm_a  = build_route_metrics(rdist_a, rdur_a, K, osrm_used)
-    ana_a = analytics(pts_n, La, Ca_n, "A: MCF + OSRM Trip", ta,
-                      osrm_used=osrm_used,
-                      route_metrics=rm_a,
-                      fuel_metrics=_fuel(rm_a["total_dist_km"]))
+    sum_a = build_pipeline_summary(
+        "Min-Cost Flow assignment",
+        "OSRM duration-matrix path heuristic",
+        "staged",
+        meta_a["assignment_cost_basis"],
+        route_model,
+        "hard capacity in assignment, then validated on the realized route",
+        "cost-first baseline",
+        road_network_usage="assignment uses the OSRM customer matrix; routing uses the shared start/end path model on OSRM routes",
+    )
     prog.progress(18, text="Rendering Pipeline A…")
-    fig_a = make_map(ll, La, Ca_n, bbox, "A — Min-Cost Flow → OSRM Trip",
-                     road_geoms=geoms_a, tile_src=tile_src)
+    fig_a, ana_a, geoms_a, trace_a = _finalize_pipeline(
+        "A", "A — Min-Cost Flow → OSRM path heuristic",
+        "A: MCF + OSRM path", La, Ca_n, ordered_a, path_cost_a, meta_a, sum_a, ta)
 
-    # ── B: P-Median + OSRM Trip ────────────────────────────────────────────
+    # ── B: P-Median + OSRM matrix path heuristic ───────────────────────────
     prog.progress(22, text="Pipeline B — P-Median territory assignment…")
     t0 = time.perf_counter()
-    Lb, Cb_n = run_pmedian(ll, K, cap_pct, pm_iters, mat)
-    prog.progress(30, text="Pipeline B — OSRM trip routing…")
-    routes_b, geoms_b, rdist_b, rdur_b = fetch_all_routes(ll, Lb, K)
-    ordered_b = {k: [int(np.where(Lb==k)[0][i]) for i in routes_b[k]]
-                 for k in range(K) if (Lb==k).any() and k in routes_b}
+    Lb, Cb_n, meta_b = run_pmedian(ll, K, cap_pct, pm_iters, mat, return_meta=True)
+    Lb, Cb_n, meta_b, _map_b = realign_labels_to_shared_starts(Lb, Cb_n, route_model, meta_b)
+    prog.progress(30, text="Pipeline B — fixed-start path sequencing…")
+    ordered_b, path_cost_b = {}, {}
+    for k in range(K):
+        stop_indices = list(np.where(Lb == k)[0])
+        order, cost = heuristic_sequence_route(stop_indices, k, route_model)
+        ordered_b[k] = order
+        path_cost_b[k] = cost
     tb = time.perf_counter() - t0
-    rm_b  = build_route_metrics(rdist_b, rdur_b, K, osrm_used)
-    ana_b = analytics(pts_n, Lb, Cb_n, "B: P-Median + OSRM Trip", tb,
-                      osrm_used=osrm_used,
-                      route_metrics=rm_b,
-                      fuel_metrics=_fuel(rm_b["total_dist_km"]))
+    sum_b = build_pipeline_summary(
+        "Capacitated P-Median territory assignment",
+        "OSRM duration-matrix path heuristic",
+        "staged",
+        meta_b["assignment_cost_basis"],
+        route_model,
+        "hard capacity in assignment, then validated on the realized route",
+        "territory benchmark",
+        road_network_usage="assignment uses the OSRM customer matrix; routing uses the shared start/end path model on OSRM routes",
+    )
     prog.progress(40, text="Rendering Pipeline B…")
-    fig_b = make_map(ll, Lb, Cb_n, bbox, "B — P-Median → OSRM Trip",
-                     road_geoms=geoms_b, tile_src=tile_src)
+    fig_b, ana_b, geoms_b, trace_b = _finalize_pipeline(
+        "B", "B — P-Median → OSRM path heuristic",
+        "B: P-Median + OSRM path", Lb, Cb_n, ordered_b, path_cost_b, meta_b, sum_b, tb)
 
-    # ── C: MCF + OR-Tools per-cluster TSP ──────────────────────────────────
-    prog.progress(44, text=f"Pipeline C — OR-Tools TSP per cluster ({c_time_limit}s)…")
+    # ── C: same assignment as A + OR-Tools path sequencing ─────────────────
+    prog.progress(44, text=f"Pipeline C — OR-Tools path sequencing ({c_time_limit}s)…")
     t0 = time.perf_counter()
-    Lc, Cc_n, _local_c, ordered_c = run_pipeline_c(ll, K, cap_pct, mat,
-                                                     time_limit_s=c_time_limit)
-    prog.progress(55, text="Pipeline C — OSRM road geometry (ordered)…")
-    # Use OR-Tools visit order for OSRM geometry — this is the fix
-    geoms_c, rdist_c, rdur_c = _route_geom_from_ordered(ordered_c, Lc)
+    Lc, Cc_n = La.copy(), Ca_n.copy()
+    meta_c = {
+        "assignment_cost_total": meta_a["assignment_cost_total"],
+        "assignment_cost_per_vehicle": dict(meta_a["assignment_cost_per_vehicle"]),
+        "assignment_cost_basis": meta_a["assignment_cost_basis"],
+        "capacity_enforced": True,
+    }
+    Lc, Cc_n, ordered_c, path_cost_c = run_pipeline_c(
+        Lc, Cc_n, route_model, time_limit_s=c_time_limit)
     tc = time.perf_counter() - t0
-    rm_c  = build_route_metrics(rdist_c, rdur_c, K, osrm_used)
-    ana_c = analytics(pts_n, Lc, Cc_n, "C: MCF + OR-Tools TSP", tc,
-                      osrm_used=osrm_used,
-                      route_metrics=rm_c,
-                      fuel_metrics=_fuel(rm_c["total_dist_km"]))
+    sum_c = build_pipeline_summary(
+        "Min-Cost Flow assignment (identical to A)",
+        "OR-Tools single-vehicle path per assigned territory",
+        "staged",
+        meta_c["assignment_cost_basis"],
+        route_model,
+        "hard capacity in assignment, then validated on the realized route",
+        "local sequencing improvement",
+        road_network_usage="assignment uses the OSRM customer matrix; sequencing optimizes the shared start/end path and is rendered on OSRM routes",
+    )
     prog.progress(63, text="Rendering Pipeline C…")
-    fig_c = make_map(ll, Lc, Cc_n, bbox, "C — MCF + OR-Tools TSP per cluster",
-                     road_geoms=geoms_c, tile_src=tile_src)
+    fig_c, ana_c, geoms_c, trace_c = _finalize_pipeline(
+        "C", "C — MCF + OR-Tools fixed-start path",
+        "C: MCF + OR-Tools path", Lc, Cc_n, ordered_c, path_cost_c, meta_c, sum_c, tc)
 
     # ── D: Full OR-Tools CVRP ──────────────────────────────────────────────
     prog.progress(67, text=f"Pipeline D — Full OR-Tools CVRP ({d_time_limit}s)…")
     t0 = time.perf_counter()
-    Ld, Cd_n, ordered_d = run_pipeline_d(ll, K, cap_pct, mat,
-                                          time_limit_s=d_time_limit,
-                                          depot_mode=d_depot_mode,
-                                          route_mode=d_route_mode)
-    prog.progress(80, text="Pipeline D — OSRM road geometry (ordered)…")
-    # Use OR-Tools route order directly — this fixes the route-order bug
-    geoms_d, rdist_d, rdur_d = _route_geom_from_ordered(ordered_d, Ld)
+    Ld, Cd_n, ordered_d, route_ll_d, meta_d = run_pipeline_d(
+        ll, route_model, time_limit_s=d_time_limit)
     td = time.perf_counter() - t0
-    rm_d  = build_route_metrics(rdist_d, rdur_d, K, osrm_used)
-    d_label = f"D — Full OR-Tools CVRP · {d_depot_mode} depot · {d_route_mode} route"
-    ana_d = analytics(pts_n, Ld, Cd_n, "D: Full OR-Tools CVRP", td,
-                      osrm_used=osrm_used,
-                      route_metrics=rm_d,
-                      fuel_metrics=_fuel(rm_d["total_dist_km"]))
+    path_cost_d = {
+        k: compute_vehicle_path_cost(ordered_d.get(k, []), k, route_model)
+        for k in range(K)
+    }
+    meta_assign_d = {
+        "assignment_cost_total": float(sum(path_cost_d.values())),
+        "assignment_cost_per_vehicle": path_cost_d,
+        "assignment_cost_basis": "Joint OR-Tools route objective with explicit starts/ends",
+        "capacity_enforced": True,
+    }
+    sum_d = build_pipeline_summary(
+        "Integrated OR-Tools CVRP assignment+routing",
+        "Integrated OR-Tools CVRP",
+        "joint",
+        meta_assign_d["assignment_cost_basis"],
+        route_model,
+        "hard capacity dimension inside the solver and validated on the realized route",
+        "integrated full benchmark",
+        road_network_usage="the joint solver uses the OSRM customer matrix plus explicit OSRM start/end legs inside one CVRP objective",
+    )
     prog.progress(87, text="Rendering Pipeline D…")
-    fig_d = make_map(ll, Ld, Cd_n, bbox, d_label,
-                     road_geoms=geoms_d, tile_src=tile_src)
+    fig_d, ana_d, geoms_d, trace_d = _finalize_pipeline(
+        "D",
+        f"D — Full OR-Tools CVRP · {route_start_policy} starts · {route_end_policy.replace('_', ' ')}",
+        "D: Full OR-Tools CVRP", Ld, Cd_n, ordered_d, path_cost_d,
+        meta_assign_d, sum_d, td, route_sequences=route_ll_d)
 
     prog.progress(92, text="Rendering animations…")
-    gif_a = make_gif(ll, La, Ca_n, bbox, geoms_a, tile_src, anim_frames, anim_fps, trail_len)
-    gif_b = make_gif(ll, Lb, Cb_n, bbox, geoms_b, tile_src, anim_frames, anim_fps, trail_len)
-    gif_c = make_gif(ll, Lc, Cc_n, bbox, geoms_c, tile_src, anim_frames, anim_fps, trail_len)
-    gif_d = make_gif(ll, Ld, Cd_n, bbox, geoms_d, tile_src, anim_frames, anim_fps, trail_len)
+    gif_a = make_gif(ll, La, Ca_n, bbox, geoms_a, tile_src, route_model, anim_frames, anim_fps, trail_len)
+    gif_b = make_gif(ll, Lb, Cb_n, bbox, geoms_b, tile_src, route_model, anim_frames, anim_fps, trail_len)
+    gif_c = make_gif(ll, Lc, Cc_n, bbox, geoms_c, tile_src, route_model, anim_frames, anim_fps, trail_len)
+    gif_d = make_gif(ll, Ld, Cd_n, bbox, geoms_d, tile_src, route_model, anim_frames, anim_fps, trail_len)
 
     prog.progress(100, text="Done."); prog.empty()
 
@@ -1343,15 +2242,77 @@ if run_btn and st.session_state.ll_pts is not None:
     st.session_state.result_d = (fig_d, ana_d, Ld, Cd_n, geoms_d)
     st.session_state.gif_a = gif_a; st.session_state.gif_b = gif_b
     st.session_state.gif_c = gif_c; st.session_state.gif_d = gif_d
+    st.session_state.route_start_policy_used = route_start_policy
+    st.session_state.route_end_policy_used = route_end_policy
+    if enable_debug_trace:
+        pipelines_payload = {
+            "A": build_pipeline_debug_payload(
+                "A", La, Ca_n, ordered_a, trace_a["route_sequences"],
+                trace_a["route_dist"], trace_a["route_dur"], path_cost_a,
+                meta_a, route_model, trace_a["validation"], sum_a, ana_a,
+                include_full_matrices=include_full_matrices),
+            "B": build_pipeline_debug_payload(
+                "B", Lb, Cb_n, ordered_b, trace_b["route_sequences"],
+                trace_b["route_dist"], trace_b["route_dur"], path_cost_b,
+                meta_b, route_model, trace_b["validation"], sum_b, ana_b,
+                include_full_matrices=include_full_matrices),
+            "C": build_pipeline_debug_payload(
+                "C", Lc, Cc_n, ordered_c, trace_c["route_sequences"],
+                trace_c["route_dist"], trace_c["route_dur"], path_cost_c,
+                meta_c, route_model, trace_c["validation"], sum_c, ana_c,
+                include_full_matrices=include_full_matrices),
+            "D": build_pipeline_debug_payload(
+                "D", Ld, Cd_n, ordered_d, trace_d["route_sequences"],
+                trace_d["route_dist"], trace_d["route_dur"], path_cost_d,
+                meta_assign_d, route_model, trace_d["validation"], sum_d, ana_d,
+                include_full_matrices=include_full_matrices),
+        }
+        debug_report = build_benchmark_debug_report(
+            {
+                "city": city,
+                "poi_type": poi_k,
+                "n_points_requested": int(n_points),
+                "n_points_loaded": int(len(ll)),
+                "n_vans": int(K),
+                "cap_pct": int(cap_pct),
+                "start_policy": route_start_policy,
+                "end_policy": route_end_policy,
+                "demand_per_stop": float(demand_per_stop),
+                "pm_iters": int(pm_iters),
+                "c_time_limit_s": int(c_time_limit),
+                "d_time_limit_s": int(d_time_limit),
+                "osrm_used": bool(osrm_used),
+                "distance_matrix_available": bool(dist_mat is not None),
+            },
+            route_model,
+            pipelines_payload,
+            dist_matrix=dist_mat,
+            include_full_matrices=include_full_matrices,
+        )
+        debug_report["benchmark_integrity_checks"] = _json_ready([
+            ana_a.get("integrity_row", {}),
+            ana_b.get("integrity_row", {}),
+            ana_c.get("integrity_row", {}),
+            ana_d.get("integrity_row", {}),
+        ])
+        st.session_state.debug_report = debug_report
+        st.session_state.debug_report_text = render_debug_report_text(debug_report)
+    else:
+        st.session_state.debug_report = None
+        st.session_state.debug_report_text = None
 
 
 # ──────────────────────────────────────────────────────
 #  DISPLAY
 # ──────────────────────────────────────────────────────
-st.markdown("# 🚐 Van Territory Planner")
+st.markdown(
+    '<div class="page-title"><span class="page-title-icon">🚐</span>'
+    '<span>Van Territory Planner</span></div>',
+    unsafe_allow_html=True,
+)
 st.markdown(
     '<p style="color:#64748b;font-family:monospace;font-size:.75rem;margin-top:-.4rem">'
-    '4 pipelines · MCF · P-Median · OR-Tools TSP · Full CVRP · OSRM street routing</p>',
+    '4 pipelines · MCF · P-Median · OR-Tools path · Full CVRP · OSRM street routing</p>',
     unsafe_allow_html=True)
 
 if st.session_state.ll_pts is None:
@@ -1365,10 +2326,8 @@ if st.session_state.ll_pts is None:
 
 elif st.session_state.result_a is None:
     ll = st.session_state.ll_pts; bbox = st.session_state.bbox
-    try:    tile_src
-    except: tile_src = ctx.providers.CartoDB.DarkMatter
-    try:    n_vans
-    except: n_vans = 4
+    tile_src = locals().get("tile_src", ctx.providers.CartoDB.DarkMatter)
+    n_vans = int(locals().get("n_vans", 4))
     with st.spinner("Loading map…"):
         fig = make_map(ll, np.zeros(len(ll), dtype=int), ll[:1].copy(),
                        bbox, f"{len(ll)} POIs · {n_vans} vans · press Run →",
@@ -1390,25 +2349,25 @@ else:
         (ca, "#3b82f6", "A — Min-Cost Flow",
          "COST-FIRST BASELINE",
          "MCF finds the globally optimal van-to-stop assignment. "
-         "OSRM /trip sequences each cluster on real roads.<br>"
+         "A fixed-start path heuristic then sequences each territory on the OSRM matrix.<br>"
          "<b>Role:</b> baseline. Cheapest assignment, fast."),
         (cb, "#f59e0b", "B — P-Median",
          "TERRITORY-FIRST BASELINE",
          "Finds K geographic territory anchors minimising distance to zone centres. "
-         "OSRM /trip sequences each territory.<br>"
+         "A fixed-start path heuristic then sequences each territory on the OSRM matrix.<br>"
          "<b>Role:</b> territory design benchmark. Shows whether compact zones matter."),
-        (cc, "#10b981", "C — MCF + OR-Tools TSP",
+        (cc, "#10b981", "C — MCF + OR-Tools Path",
          "SAME ZONES AS A, BETTER ORDERING",
-         "MCF assignment (identical to A) + OR-Tools per-cluster TSP with "
-         "Guided Local Search. Answers: was A weak because of bad stop ordering?<br>"
+         "MCF assignment (identical to A) + OR-Tools path routing under the same "
+         "shared start/end assumptions. Answers: was A weak because of stop ordering?<br>"
          "<b>Role:</b> isolates routing quality from assignment quality."),
         (cd, "#8b5cf6", "D — Full OR-Tools CVRP",
          "INTEGRATED SINGLE-STAGE BENCHMARK",
          "OR-Tools decides assignment AND route order simultaneously with capacity "
          "constraints. The real production-shaped free benchmark.<br>"
          "<b>Role:</b> main serious benchmark. Closest to modern VRP solvers.<br>"
-         "<b style='color:#facc15'>Note:</b> Total Route includes depot-return "
-         "costs that A/B/C don't count — compare on Balance CV and Zone Overlap."),
+         "<b style='color:#facc15'>Note:</b> D now shares the same start/end model as "
+         "A/B/C, so route totals are apples-to-apples."),
     ]
     for col, color, title, sub, desc in CARDS:
         col.markdown(f"""<div style="background:#0d1526;border:2px solid {color}33;
@@ -1447,7 +2406,7 @@ else:
                     st.image(gb, width="stretch")
                     st.download_button(f"⬇️ GIF {letter}", data=gb,
                                        file_name=f"dispatch_{letter.lower()}.gif",
-                                       mime="image/gif", use_container_width=True)
+                                       mime="image/gif", width="stretch")
             with st2:
                 cv  = ana["cv"]
                 cls = ("metric-good" if cv < 0.15 else
@@ -1463,6 +2422,10 @@ else:
                 mc("Stops: min/avg/max",
                    f"{ana['min']} / {ana['mean']:.0f} / {ana['max']}")
                 mc("Exec Time", f"{ana['time_ms']:.0f} ms")
+                mc("Assignment Cost", f"{ana.get('assignment_cost_total_s', 0):.1f} s")
+                mc("Model Route Cost", f"{ana.get('routing_cost_total_s', 0):.1f} s")
+                mc("Feasible", "YES" if ana.get("feasible") else "NO",
+                   "metric-good" if ana.get("feasible") else "metric-bad")
 
                 # ── Route metrics ─────────────────────────────────────────
                 st.markdown('<p style="font-family:monospace;font-size:.62rem;color:#475569;'
@@ -1475,9 +2438,10 @@ else:
                        f"{ana['total_dist_km']:.2f} km ({ana['total_dist_m']:.0f} m)")
                     mc("Avg per Van",
                        f"{ana['avg_dur_min']:.1f} min · {ana['avg_dist_km']:.2f} km")
-                elif "tour_s" in ana and ana["tour_s"] > 0:
-                    unit = "s (road)" if ana.get("osrm") else "norm units"
-                    mc("Total Route ↓", f"{ana['tour_s']:.0f} {unit}", "metric-warn")
+                elif ana.get("total_dur_s", 0) > 0:
+                    mc("Total Drive Time", f"{ana['total_dur_min']:.1f} min (approx)", "metric-warn")
+                    mc("Total Distance", f"{ana['total_dist_km']:.2f} km (approx)", "metric-warn")
+                    mc("Avg per Van", f"{ana['avg_dur_min']:.1f} min · {ana['avg_dist_km']:.2f} km", "metric-warn")
                 else:
                     mc("Total Route", "OSRM unavailable", "metric-bad")
 
@@ -1501,6 +2465,37 @@ else:
                    "metric-warn" if ana['hull_overlap'] < 0.7 else "metric-bad")
                 mc("Isolation ↑", f"{ana['isolation']:.3f}")
                 st.pyplot(size_chart(ana["sizes"]), width="stretch"); plt.close()
+
+                # ── Assumptions / audit block ────────────────────────────────
+                summ = ana.get("summary", {})
+                st.markdown('<p style="font-family:monospace;font-size:.62rem;color:#475569;'
+                    'text-transform:uppercase;letter-spacing:.08em;margin:.4rem 0 .25rem">'
+                    'Assumptions</p>', unsafe_allow_html=True)
+                st.markdown(f"""<div class="insight-box">
+                <b>Assignment:</b> {summ.get('assignment_method', 'n/a')}<br>
+                <b>Sequencing:</b> {summ.get('sequencing_method', 'n/a')}<br>
+                <b>Benchmark mode:</b> {summ.get('integration_mode', 'n/a')}<br>
+                <b>Route model:</b> {summ.get('route_model', 'n/a')}<br>
+                <b>Road-network usage:</b> {summ.get('road_network_usage', 'n/a')}<br>
+                <b>Assignment cost basis:</b> {summ.get('assignment_cost_basis', 'n/a')}<br>
+                <b>Routing cost basis:</b> {summ.get('routing_cost_basis', 'n/a')}<br>
+                <b>Capacity:</b> {summ.get('capacity_treatment', 'n/a')}<br>
+                <b>Use case:</b> {summ.get('intended_use', 'n/a')}
+                </div>""", unsafe_allow_html=True)
+
+                # ── Validation output example ────────────────────────────────
+                st.markdown('<p style="font-family:monospace;font-size:.62rem;color:#475569;'
+                    'text-transform:uppercase;letter-spacing:.08em;margin:.4rem 0 .25rem">'
+                    'Validation</p>', unsafe_allow_html=True)
+                st.dataframe(pd.DataFrame(ana.get("validation_checks", [])),
+                             width="stretch", hide_index=True)
+
+                # ── Per-van log ──────────────────────────────────────────────
+                st.markdown('<p style="font-family:monospace;font-size:.62rem;color:#475569;'
+                    'text-transform:uppercase;letter-spacing:.08em;margin:.4rem 0 .25rem">'
+                    'Per-Van Log</p>', unsafe_allow_html=True)
+                st.dataframe(pd.DataFrame(ana.get("van_log", [])),
+                             width="stretch", hide_index=True)
 
     for col, (letter, fig, ana, gif, color) in zip(cols4, PIPELINES):
         show_pipeline(col, letter, fig, ana, gif, color)
@@ -1542,6 +2537,49 @@ else:
         <div style="font-family:monospace;font-size:.62rem;
              color:{COLORS[winner]};margin-top:.3rem">🏆 Pipeline {winner}</div>
         </div>""", unsafe_allow_html=True)
+
+    # ── benchmark integrity checks ──────────────────────────────────────────
+    st.divider()
+    st.markdown("### Benchmark Integrity Checks")
+    integrity_df = pd.DataFrame([
+        ana_a.get("integrity_row", {}),
+        ana_b.get("integrity_row", {}),
+        ana_c.get("integrity_row", {}),
+        ana_d.get("integrity_row", {}),
+    ])
+    st.dataframe(integrity_df, width="stretch", hide_index=True)
+
+    # ── detailed trace export ──────────────────────────────────────────────
+    if st.session_state.debug_report is not None:
+        st.divider()
+        st.markdown("### Detailed Benchmark Trace")
+        debug_json = json.dumps(st.session_state.debug_report, indent=2, ensure_ascii=False)
+        debug_text = st.session_state.debug_report_text or ""
+        d1, d2 = st.columns(2)
+        d1.download_button(
+            "⬇️ Download Trace JSON",
+            data=debug_json,
+            file_name="benchmark_trace.json",
+            mime="application/json",
+            width="stretch",
+        )
+        d2.download_button(
+            "⬇️ Download Trace TXT",
+            data=debug_text,
+            file_name="benchmark_trace.txt",
+            mime="text/plain",
+            width="stretch",
+        )
+        with st.expander("Trace Preview", expanded=False):
+            st.markdown(
+                '<p style="font-family:monospace;font-size:.68rem;color:#94a3b8">'
+                'The exported trace includes route-model inputs, matrix stats, assignment metadata, '
+                'per-stop details, per-van leg-by-leg calculations, validations, and final pipeline metrics.'
+                '</p>',
+                unsafe_allow_html=True,
+            )
+            st.code(debug_text[:12000] + ("\n\n... truncated in preview ..." if len(debug_text) > 12000 else ""),
+                    language="text")
 
     # ── metrics legend ───────────────────────────────────────────────────────
     st.divider()
@@ -1605,15 +2643,15 @@ else:
          "In production these run on dedicated infrastructure in parallel; "
          "wall time matters less than solution quality."),
 
-        ("🏗️", "Pipeline D depot modes",
-         "<b>centroid</b> — all vans share a single geographic centroid as depot. "
-         "Simplest model, comparable to A/B/C.<br>"
-         "<b>seeded</b> — each van starts at its MCF cluster centre. "
-         "More realistic: each van effectively 'owns' a territory from the start.<br>"
-         "<b>random</b> — random start positions. Tests solver robustness.<br>"
-         "<b>closed</b> route = vans return to start (standard CVRP). "
-         "<b>open</b> route = vans finish at their last stop (no forced return leg). "
-         "Open routes produce shorter measured routes but may not reflect real operations."),
+        ("🏗️", "Shared Route Model",
+         "All four pipelines now use the same start policy, end policy, demand model, "
+         "and capacity definition.<br>"
+         "<b>seeded</b> = common geographic van starts for every pipeline.<br>"
+         "<b>centroid</b> = one shared depot for every pipeline.<br>"
+         "<b>random</b> = shared random starts for robustness testing.<br>"
+         "<b>open</b> = finish at the last stop.<br>"
+         "<b>return_to_start</b> = finish where that van started.<br>"
+         "<b>return_to_depot</b> = finish at the shared centroid depot."),
     ]
 
     for icon, title, desc in legend:
@@ -1636,8 +2674,8 @@ else:
     {'<b style="color:#4ade80">🛣 OSRM active</b>' if osrm else '<b style="color:#f87171">📐 OSRM unavailable — Euclidean fallback</b>'}
     {" · distances available" if dist_available else " · durations only (distances estimated from duration×speed)" if osrm else ""}
     &nbsp;·&nbsp; <b style="color:#a78bfa">🔧 OR-Tools</b>:
-    C = per-cluster TSP (same zones as A, better ordering) ·
-    D = full integrated CVRP ({f"{st.session_state.get('d_depot_mode_used','centroid')} depot" if True else ""}).<br>
+    C = per-cluster OR-Tools path (same zones as A, better ordering) ·
+    Shared route model = {st.session_state.get('route_start_policy_used','seeded')} starts · {st.session_state.get('route_end_policy_used','open').replace('_', ' ')}.<br>
     <b>Approximations in use:</b> fuel metrics assume constant speed/consumption ·
     zone overlap uses bounding-box proxy (not exact hull intersection) ·
     open-route mode models return arcs as zero-cost (approximation).<br>
